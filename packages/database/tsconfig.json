@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolvePackageJsonExports": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "declarationMap": true,
+    "removeComments": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "types": ["node"],
+    "incremental": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

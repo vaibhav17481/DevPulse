@@ -1,0 +1,428 @@
+// DevPulse initial schema.
+//
+// Application-level invariant: every active workspace must retain at least one
+// OWNER membership. This is enforced transactionally by workspace services, not
+// by an ordinary Prisma relation or unique constraint.
+
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum GitHubAccountType {
+  USER
+  ORGANIZATION
+}
+
+enum GitHubInstallationStatus {
+  ACTIVE
+  SUSPENDED
+  DISCONNECTED
+}
+
+enum RepositoryVisibility {
+  PUBLIC
+  PRIVATE
+  INTERNAL
+}
+
+enum RepositoryConnectionStatus {
+  ACTIVE
+  DISCONNECTED
+}
+
+enum PullRequestState {
+  OPEN
+  CLOSED
+  MERGED
+}
+
+enum IssueState {
+  OPEN
+  CLOSED
+}
+
+enum WorkflowRunStatus {
+  QUEUED
+  IN_PROGRESS
+  COMPLETED
+  REQUESTED
+  WAITING
+  PENDING
+}
+
+enum WorkflowRunConclusion {
+  SUCCESS
+  FAILURE
+  CANCELLED
+  SKIPPED
+  TIMED_OUT
+  ACTION_REQUIRED
+  NEUTRAL
+  STALE
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum RecommendationStatus {
+  OPEN
+  ACCEPTED
+  IN_PROGRESS
+  DISMISSED
+  COMPLETED
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String?  @unique @db.VarChar(320)
+  name         String?  @db.VarChar(255)
+  avatarUrl    String?  @map("avatar_url") @db.VarChar(2048)
+  githubId     BigInt?  @unique @map("github_id")
+  githubLogin  String?  @map("github_login") @db.VarChar(255)
+  passwordHash String?  @map("password_hash") @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  sessions         Session[]
+  workspaceMembers WorkspaceMember[]
+  sentInvitations  WorkspaceInvitation[] @relation("InvitationInviter")
+
+  @@map("users")
+}
+
+model Session {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model Workspace {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(255)
+  slug        String   @unique @db.VarChar(100)
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  members            WorkspaceMember[]
+  invitations        WorkspaceInvitation[]
+  projects           Project[]
+  githubInstallation GitHubInstallation?
+  repositories       Repository[]
+  webhookEvents      WebhookEvent[]
+  pullRequests       PullRequest[]
+  issues             Issue[]
+  workflowRuns       WorkflowRun[]
+  riskAssessments    RiskAssessment[]
+  recommendations    Recommendation[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @map("workspace_id") @db.Uuid
+  userId      String        @map("user_id") @db.Uuid
+  role        WorkspaceRole
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@index([workspaceId, role])
+  @@map("workspace_members")
+}
+
+model WorkspaceInvitation {
+  id          String           @id @default(uuid()) @db.Uuid
+  workspaceId String           @map("workspace_id") @db.Uuid
+  email       String           @db.VarChar(320)
+  role        WorkspaceRole
+  tokenHash   String           @unique @map("token_hash") @db.VarChar(255)
+  status      InvitationStatus @default(PENDING)
+  invitedById String?          @map("invited_by_id") @db.Uuid
+  expiresAt   DateTime         @map("expires_at") @db.Timestamptz(6)
+  acceptedAt  DateTime?        @map("accepted_at") @db.Timestamptz(6)
+  revokedAt   DateTime?        @map("revoked_at") @db.Timestamptz(6)
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User?     @relation("InvitationInviter", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+  @@index([email])
+  @@index([expiresAt])
+  @@index([invitedById])
+  @@map("workspace_invitations")
+}
+
+model Project {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  name        String   @db.VarChar(255)
+  slug        String   @db.VarChar(100)
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  repository      Repository?
+  riskAssessments RiskAssessment[]
+  recommendations Recommendation[]
+
+  @@unique([workspaceId, slug])
+  @@unique([id, workspaceId])
+  @@map("projects")
+}
+
+model GitHubInstallation {
+  id                   String                   @id @default(uuid()) @db.Uuid
+  workspaceId          String                   @unique @map("workspace_id") @db.Uuid
+  githubInstallationId BigInt                   @unique @map("github_installation_id")
+  accountLogin         String                   @map("account_login") @db.VarChar(255)
+  accountType          GitHubAccountType        @map("account_type")
+  status               GitHubInstallationStatus @default(ACTIVE)
+  permissions          String[]                 @default([])
+  lastSyncedAt         DateTime?                @map("last_synced_at") @db.Timestamptz(6)
+  createdAt            DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  repositories  Repository[]
+  webhookEvents WebhookEvent[]
+
+  @@index([status])
+  @@map("github_installations")
+}
+
+model Repository {
+  id               String                     @id @default(uuid()) @db.Uuid
+  workspaceId      String                     @map("workspace_id") @db.Uuid
+  projectId        String                     @unique @map("project_id") @db.Uuid
+  installationId   String                     @map("installation_id") @db.Uuid
+  githubId         BigInt                     @unique @map("github_id")
+  ownerLogin       String                     @map("owner_login") @db.VarChar(255)
+  name             String                     @db.VarChar(255)
+  fullName         String                     @map("full_name") @db.VarChar(512)
+  defaultBranch    String?                    @map("default_branch") @db.VarChar(255)
+  visibility       RepositoryVisibility
+  isArchived       Boolean                    @default(false) @map("is_archived")
+  connectionStatus RepositoryConnectionStatus @default(ACTIVE) @map("connection_status")
+  connectedAt      DateTime                   @default(now()) @map("connected_at") @db.Timestamptz(6)
+  disconnectedAt   DateTime?                  @map("disconnected_at") @db.Timestamptz(6)
+  lastSyncedAt     DateTime?                  @map("last_synced_at") @db.Timestamptz(6)
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace     Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  project       Project            @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+  installation  GitHubInstallation @relation(fields: [installationId], references: [id], onDelete: Restrict)
+  pullRequests  PullRequest[]
+  issues        Issue[]
+  workflowRuns  WorkflowRun[]
+  webhookEvents WebhookEvent[]
+
+  @@unique([projectId, workspaceId])
+  @@unique([id, workspaceId])
+  @@index([installationId])
+  @@index([workspaceId, connectionStatus])
+  @@index([lastSyncedAt])
+  @@map("repositories")
+}
+
+model WebhookEvent {
+  id               String             @id @default(uuid()) @db.Uuid
+  workspaceId      String?            @map("workspace_id") @db.Uuid
+  installationId   String?            @map("installation_id") @db.Uuid
+  repositoryId     String?            @map("repository_id") @db.Uuid
+  githubDeliveryId String             @unique @map("github_delivery_id") @db.VarChar(255)
+  eventType        String             @map("event_type") @db.VarChar(100)
+  action           String?            @db.VarChar(100)
+  status           WebhookEventStatus @default(RECEIVED)
+  attempts         Int                @default(0)
+  lastError        String?            @map("last_error") @db.Text
+  nextAttemptAt    DateTime?          @map("next_attempt_at") @db.Timestamptz(6)
+  receivedAt       DateTime           @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt      DateTime?          @map("processed_at") @db.Timestamptz(6)
+  updatedAt        DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace    Workspace?          @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  installation GitHubInstallation? @relation(fields: [installationId], references: [id], onDelete: SetNull)
+  repository   Repository?         @relation(fields: [repositoryId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, receivedAt])
+  @@index([installationId, receivedAt])
+  @@index([repositoryId, receivedAt])
+  @@index([status, nextAttemptAt])
+  @@index([eventType, receivedAt])
+  @@map("webhook_events")
+}
+
+model PullRequest {
+  id              String           @id @default(uuid()) @db.Uuid
+  workspaceId     String           @map("workspace_id") @db.Uuid
+  repositoryId    String           @map("repository_id") @db.Uuid
+  githubId        BigInt           @map("github_id")
+  number          Int
+  title           String           @db.VarChar(1024)
+  state           PullRequestState
+  authorLogin     String?          @map("author_login") @db.VarChar(255)
+  sourceBranch    String           @map("source_branch") @db.VarChar(255)
+  targetBranch    String           @map("target_branch") @db.VarChar(255)
+  isDraft         Boolean          @default(false) @map("is_draft")
+  githubCreatedAt DateTime         @map("github_created_at") @db.Timestamptz(6)
+  githubUpdatedAt DateTime         @map("github_updated_at") @db.Timestamptz(6)
+  githubMergedAt  DateTime?        @map("github_merged_at") @db.Timestamptz(6)
+  githubClosedAt  DateTime?        @map("github_closed_at") @db.Timestamptz(6)
+  additions       Int?
+  deletions       Int?
+  lastSyncedAt    DateTime?        @map("last_synced_at") @db.Timestamptz(6)
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  repository Repository @relation(fields: [repositoryId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+
+  @@unique([repositoryId, githubId])
+  @@index([workspaceId, githubUpdatedAt])
+  @@index([repositoryId, state])
+  @@index([repositoryId, githubCreatedAt])
+  @@map("pull_requests")
+}
+
+model Issue {
+  id              String     @id @default(uuid()) @db.Uuid
+  workspaceId     String     @map("workspace_id") @db.Uuid
+  repositoryId    String     @map("repository_id") @db.Uuid
+  githubId        BigInt     @map("github_id")
+  number          Int
+  title           String     @db.VarChar(1024)
+  state           IssueState
+  authorLogin     String?    @map("author_login") @db.VarChar(255)
+  githubCreatedAt DateTime   @map("github_created_at") @db.Timestamptz(6)
+  githubUpdatedAt DateTime   @map("github_updated_at") @db.Timestamptz(6)
+  githubClosedAt  DateTime?  @map("github_closed_at") @db.Timestamptz(6)
+  lastSyncedAt    DateTime?  @map("last_synced_at") @db.Timestamptz(6)
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  repository Repository @relation(fields: [repositoryId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+
+  @@unique([repositoryId, githubId])
+  @@index([workspaceId, githubUpdatedAt])
+  @@index([repositoryId, state])
+  @@index([repositoryId, githubCreatedAt])
+  @@map("issues")
+}
+
+model WorkflowRun {
+  id           String                 @id @default(uuid()) @db.Uuid
+  workspaceId  String                 @map("workspace_id") @db.Uuid
+  repositoryId String                 @map("repository_id") @db.Uuid
+  githubId     BigInt                 @map("github_id")
+  workflowName String                 @map("workflow_name") @db.VarChar(255)
+  runNumber    Int?                   @map("run_number")
+  event        String?                @db.VarChar(100)
+  status       WorkflowRunStatus
+  conclusion   WorkflowRunConclusion?
+  branch       String?                @db.VarChar(255)
+  headSha      String?                @map("head_sha") @db.VarChar(64)
+  startedAt    DateTime?              @map("started_at") @db.Timestamptz(6)
+  completedAt  DateTime?              @map("completed_at") @db.Timestamptz(6)
+  lastSyncedAt DateTime?              @map("last_synced_at") @db.Timestamptz(6)
+  createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  repository Repository @relation(fields: [repositoryId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+
+  @@unique([repositoryId, githubId])
+  @@index([workspaceId, startedAt])
+  @@index([repositoryId, status])
+  @@index([repositoryId, startedAt])
+  @@map("workflow_runs")
+}
+
+model RiskAssessment {
+  id               String   @id @default(uuid()) @db.Uuid
+  workspaceId      String   @map("workspace_id") @db.Uuid
+  projectId        String   @map("project_id") @db.Uuid
+  score            Decimal  @db.Decimal(5, 2)
+  algorithmVersion String   @map("algorithm_version") @db.VarChar(100)
+  assessedAt       DateTime @map("assessed_at") @db.Timestamptz(6)
+  evidence         Json     @db.JsonB
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  project         Project          @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+  recommendations Recommendation[]
+
+  @@index([workspaceId, assessedAt])
+  @@index([projectId, assessedAt])
+  @@map("risk_assessments")
+}
+
+model Recommendation {
+  id               String               @id @default(uuid()) @db.Uuid
+  workspaceId      String               @map("workspace_id") @db.Uuid
+  projectId        String               @map("project_id") @db.Uuid
+  riskAssessmentId String?              @map("risk_assessment_id") @db.Uuid
+  title            String               @db.VarChar(255)
+  description      String               @db.Text
+  category         String               @db.VarChar(100)
+  status           RecommendationStatus @default(OPEN)
+  evidence         Json?                @db.JsonB
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  project        Project         @relation(fields: [projectId, workspaceId], references: [id, workspaceId], onDelete: Restrict)
+  riskAssessment RiskAssessment? @relation(fields: [riskAssessmentId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+  @@index([projectId, status])
+  @@index([riskAssessmentId])
+  @@map("recommendations")
+}
