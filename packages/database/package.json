@@ -23,6 +23,7 @@
     "migrate:dev": "prisma migrate dev",
     "migrate:deploy": "prisma migrate deploy",
     "migrate:status": "prisma migrate status",
+    "test:integration": "node --test test/workspace-ownership.test.mjs",
     "studio": "prisma studio"
   },
   "dependencies": {

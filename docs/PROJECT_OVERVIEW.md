@@ -110,10 +110,19 @@ Unless a future requirement changes them, DevPulse is not intended to:
 - Perform code review or source-code analysis by default
 - Collect personal data that is not required for the approved insights
 
+## Resolved product decisions
+
+- GitHub integration uses a GitHub App.
+- A DevPulse Project is a minimal workspace-scoped container for one connected
+  GitHub repository. It is not a task tracker, issue board, or general
+  project-management suite.
+- Project creation is tied to repository selection through the GitHub App rather
+  than manual repository metadata entry. A GitHub repository cannot be connected
+  to multiple DevPulse projects or workspaces at the same time.
+
 ## Open product decisions
 
 - Which MVP features are required for the first release
-- Whether GitHub integration uses a GitHub App, OAuth app, or both
 - Which roles and permissions exist
 - Which metrics and insights are considered essential
 - How long metadata is retained

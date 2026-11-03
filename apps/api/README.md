@@ -14,6 +14,21 @@ pnpm --filter api start:dev
 
 The API listens on http://localhost:3001 by default. Set `PORT` to change it.
 
+The API loads the root `.env` file at startup. `DATABASE_URL` is required before
+the API can start; use `.env.example` as the template. Apply the committed Prisma
+migrations to the configured database before starting the API:
+
+```bash
+pnpm --filter @devpulse/database migrate:deploy
+```
+
+## Registration endpoint
+
+`POST /auth/register` creates an email/password account. Emails are trimmed and
+lowercased, passwords must be 12-128 characters with at least one letter and one
+number, and passwords are hashed with Argon2id. The endpoint returns only the
+created user's `id` and `email`; it does not create a session or cookie.
+
 ## Build and run
 
 ```bash

@@ -1,6 +1,6 @@
 # DevPulse Progress
 
-Last updated: 2026-10-31
+Last updated: 2026-11-04
 
 ## Status legend
 
@@ -14,10 +14,10 @@ Last updated: 2026-10-31
 | Phase | Status | Notes |
 | --- | --- | --- |
 | Phase 1: Foundation and Documentation | Completed | Batches 1 and 2 complete |
-| Phase 2: Local Infrastructure and Database Foundation | In progress | Batch 3 adds local PostgreSQL and Redis; Batch 5B adds the Prisma 7 database package; Batch 5C adds the initial schema; no migration has been applied |
+| Phase 2: Local Infrastructure and Database Foundation | In progress | Batch 3 adds local PostgreSQL and Redis; Batch 5B adds the Prisma 7 database package; Batch 5C adds the initial schema; Batch 6B adds the `init_devpulse` migration; Batches 6C and 6D verify authentication and session flows, and Batches 7B through 7D verify workspace creation, listing, retrieval, updates, and deletion on isolated PostgreSQL instances; Batch 7E adds database-enforced workspace ownership invariants and an integration test. The Docker Compose development database is not migrated or verified |
 | Phase 3: Shared Contracts and Core Skeleton | Not started | No `packages/shared` or `packages/core` yet |
-| Phase 4: Authentication and Workspace Management | Not started | Not implemented |
-| Phase 5: GitHub Metadata Integration | Not started | Not implemented |
+| Phase 4: Authentication and Workspace Management | In progress | Batch 6D adds login, database-backed session validation, an authentication guard, current-user lookup, and logout; Batch 7A adds authenticated workspace creation with an initial `OWNER` membership; Batch 7B adds membership-filtered workspace listing and retrieval; Batch 7C adds owner/admin workspace detail updates; Batch 7D adds owner-only transactional workspace deletion; Batch 7E adds database-enforced last-owner protection and documents the planned ownership-transfer design. Member management, invitations, role changes, ownership transfer, and broader RBAC remain unimplemented |
+| Phase 5: GitHub Metadata Integration | Not started | GitHub App is the selected approach; not implemented |
 | Phase 6: Repository and Pull Request Metadata | Not started | Not implemented |
 | Phase 7: Background Worker and Sync Reliability | In progress | Independent worker scaffold added; BullMQ consumers and sync reliability not started |
 | Phase 8: Deployment and CI Metadata | Not started | Not implemented |
@@ -409,8 +409,9 @@ Decisions:
   algorithm-specific and must remain explainable without storing source code.
 - Repository disconnection is represented by connection status and timestamps;
   repository data deletion remains a separate operation.
-- The at-least-one-owner workspace rule is documented as an application-level
-  transactional invariant.
+- The at-least-one-owner workspace rule was initially documented as an
+  application-level transactional invariant; Batch 7E added database trigger
+  enforcement.
 
 Verification status:
 
@@ -426,10 +427,583 @@ Verification status:
   no lint configuration yet.
 - Root `pnpm test` passed: API 1 suite/1 test and worker 1 test. The database
   package has no test framework yet.
-- No migration was created or applied, and no live PostgreSQL runtime
-  integration was verified.
+- At the time of Batch 5C, no migration had been created or applied and no live
+  PostgreSQL runtime integration had been verified. Batch 6B later added and
+  verified the initial migration.
 - No API endpoints, authentication logic, webhook handlers, seed data, or
   application code were added.
+
+### Batch 6B: Email/password registration
+
+Status: **Completed for code, migration creation, and isolated live PostgreSQL
+verification.** The Docker Compose development database has not been migrated or
+used for live verification because Docker access is unavailable.
+
+Created:
+
+- `apps/api/src/auth/auth.constants.ts`
+- `apps/api/src/auth/auth.controller.ts`
+- `apps/api/src/auth/auth.module.ts`
+- `apps/api/src/auth/auth.service.ts`
+- `apps/api/src/auth/auth.types.ts`
+- `apps/api/src/auth/email.ts`
+- `apps/api/src/auth/password.service.ts`
+- `apps/api/src/auth/dto/register.dto.ts`
+- `apps/api/src/auth/auth.service.spec.ts`
+- `apps/api/src/auth/password.service.spec.ts`
+- `apps/api/src/database/database.module.ts`
+- `apps/api/src/database/database.service.ts`
+- `apps/api/src/app.setup.ts`
+- `apps/api/src/environment.ts`
+- `apps/api/test/auth.e2e-spec.ts`
+- `packages/database/prisma/migrations/migration_lock.toml`
+- `packages/database/prisma/migrations/20261102064516_init_devpulse/migration.sql`
+
+Modified:
+
+- `README.md`
+- `apps/api/README.md`
+- `apps/api/package.json`
+- `apps/api/src/app.module.ts`
+- `apps/api/src/main.ts`
+- `apps/api/test/app.e2e-spec.ts`
+- `docs/API_CONTRACT.md`
+- `docs/ARCHITECTURE.md`
+- `docs/DATABASE_DESIGN.md`
+- `docs/DEVELOPMENT_ROADMAP.md`
+- `docs/PROGRESS.md`
+- `docs/PROJECT_OVERVIEW.md`
+- Root `pnpm-lock.yaml` after dependency installation
+
+Delivered:
+
+- `POST /auth/register` endpoint with `201 Created` success responses
+- Email normalization through trimming and lowercasing before validation,
+  duplicate checks, and storage
+- Email validation with a 320-character maximum
+- Password policy requiring 12-128 characters with at least one letter and one
+  number
+- Unknown request fields rejected through a global NestJS `ValidationPipe`
+- Argon2id password hashing using `@node-rs/argon2` 2.2.2 with 19 MiB memory,
+  two passes, parallelism of one, and a 32-byte output
+- Shared `@devpulse/database` client access through a NestJS database service
+- Duplicate email handling through a pre-check and Prisma `P2002` unique
+  constraint protection
+- Safe responses containing only user `id` and `email`
+- Generic error responses for unexpected database failures
+- Unit tests for registration and password hashing
+- HTTP integration tests using Jest, Supertest, and a mocked database service
+- Initial `init_devpulse` Prisma migration for the complete Batch 5C schema
+- Live registration verification against an isolated PostgreSQL instance,
+  including persistence, Argon2id hash verification, normalized email, duplicate
+  conflict behavior, and cleanup of the test user
+
+Verification status:
+
+- `pnpm --filter @devpulse/database exec prisma migrate dev --name init_devpulse`
+  created and applied the initial migration against an isolated empty PostgreSQL
+  18.6 database.
+- `pnpm --filter @devpulse/database generate` passed.
+- `pnpm --filter @devpulse/database exec prisma migrate status` reported
+  `Database schema is up to date!` for the isolated verification database.
+- Live verification produced `201 Created`, the response contained only `id` and
+  `email`, and the stored email was normalized.
+- The stored password hash was Argon2id and verified against the submitted
+  password without exposing the password or hash.
+- A duplicate registration using the same normalized email returned `409`.
+- Exactly one test user row existed during verification; it was deleted by ID and
+  the `users` table returned to zero rows.
+- Root `.env` is missing, the Docker socket is not accessible to the current user,
+  and the system PostgreSQL on port 5432 rejects the documented local defaults.
+  The Docker Compose development database therefore remains unmigrated and
+  unverified.
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand` passed: 3 suites and 7 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 2 suites and 6 tests.
+- `pnpm --filter api build` passed.
+- Root `pnpm typecheck` passed.
+- Root `pnpm lint` passed.
+- Root `pnpm test` passed: API 3 suites/7 tests and worker 1 test.
+- Root `pnpm build` passed.
+- No session creation, cookies, login, logout, password reset, email
+  verification, OAuth/GitHub authentication, frontend UI, or schema change was
+  added.
+
+### Batch 6C: Login, opaque sessions, and session cookies
+
+Status: **Completed for code, tests, and isolated PostgreSQL verification.** The
+Docker Compose development database remains unmigrated and unverified.
+
+Created:
+
+- `apps/api/src/auth/dto/login.dto.ts`
+- `apps/api/src/auth/session.constants.ts`
+- `apps/api/src/auth/session-cookie.ts`
+- `apps/api/src/auth/session-cookie.spec.ts`
+- `apps/api/src/auth/session-token.ts`
+- `apps/api/src/auth/session.service.ts`
+- `apps/api/src/auth/session.service.spec.ts`
+- `apps/api/src/cors.ts`
+- `apps/api/src/cors.spec.ts`
+- `apps/api/test/auth-login.e2e-spec.ts`
+
+Modified:
+
+- `.env.example`
+- `apps/api/src/auth/auth.controller.ts`
+- `apps/api/src/auth/auth.module.ts`
+- `apps/api/src/auth/auth.service.ts`
+- `apps/api/src/auth/auth.service.spec.ts`
+- `apps/api/src/auth/auth.types.ts`
+- `apps/api/src/auth/password.service.ts`
+- `apps/api/src/auth/password.service.spec.ts`
+- `apps/api/src/main.ts`
+
+Delivered:
+
+- `POST /auth/login` with normalized email lookup and Argon2id verification
+- Generic `401 Invalid email or password.` responses for unknown accounts,
+  incorrect passwords, and password-less accounts
+- Dummy Argon2id verification for unknown accounts to reduce timing differences
+- Seven-day database-backed sessions with 32-byte opaque tokens
+- SHA-256 token hashes stored in PostgreSQL; raw tokens are never persisted
+- HTTP-only `devpulse_session` cookie with `SameSite=Lax`, `Path=/`, and
+  production-only `Secure`
+- Configurable credentialed CORS through `CORS_ALLOWED_ORIGINS`, with wildcard
+  and malformed origins rejected
+- Login unit, cookie, CORS, and HTTP integration tests
+- Isolated PostgreSQL verification of login, cookie flags, token hashing,
+  session expiration, and cleanup
+
+Verification status:
+
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api test --runInBand` passed: 6 suites and 24 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 3 suites and 13 tests.
+- `pnpm --filter api build` passed.
+- Live verification against an isolated PostgreSQL 18.6 instance confirmed
+  registration and login, a seven-day session, HTTP-only/Lax/path-scoped cookies,
+  SHA-256-only persistence, no raw token in the response, and cleanup.
+- Two expiration comparisons in the first live script used `pg` parsing that
+  misread the server timezone; a follow-up Prisma check confirmed `expiresAt`
+  round-tripped exactly and the cookie expiry matched the intended seven-day
+  lifetime.
+- No schema change, migration, or new dependency was added.
+
+### Batch 6D: Session validation, authentication guard, current user, and logout
+
+Status: **Completed for code, tests, and isolated PostgreSQL/HTTP verification.**
+The Docker Compose development database remains unmigrated and unverified.
+
+Created:
+
+- `apps/api/src/auth/session-auth.guard.ts`
+- `apps/api/src/auth/session-auth.guard.spec.ts`
+- `apps/api/test/auth-session.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/auth/auth.controller.ts`
+- `apps/api/src/auth/auth.module.ts`
+- `apps/api/src/auth/auth.types.ts`
+- `apps/api/src/auth/session-cookie.ts`
+- `apps/api/src/auth/session-cookie.spec.ts`
+- `apps/api/src/auth/session-token.ts`
+- `apps/api/src/auth/session.service.ts`
+- `apps/api/src/auth/session.service.spec.ts`
+- `docs/API_CONTRACT.md`
+- `docs/ARCHITECTURE.md`
+- `docs/DATABASE_DESIGN.md`
+- `docs/PROGRESS.md`
+
+Delivered:
+
+- Reusable session validation that reads the cookie, rejects malformed tokens,
+  hashes the token with SHA-256, and requires an unrevoked, unexpired session with
+  an existing associated user
+- No sliding expiration and no `lastUsedAt` update during validation
+- Reusable `SessionAuthGuard` that attaches only a safe `id`/`email` identity and
+  returns a generic `401 Authentication required.` for invalid authentication
+- `GET /auth/me` returning only the authenticated user's safe identity
+- `POST /auth/logout` that revokes only the current session, clears the cookie
+  with matching path/security options, and returns `204` for valid, missing,
+  malformed, expired, or already-revoked sessions
+- Idempotent repeated logout without exposing whether a session existed
+- Unit tests for token/cookie parsing, session validation, revocation, and the
+  guard
+- HTTP integration tests for missing, malformed, valid, expired, revoked, and
+  user-missing sessions; `me`; logout; repeated logout; cookie clearing; and
+  single-session revocation isolation
+
+Verification status:
+
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api test --runInBand` passed: 7 suites and 43 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 4 suites and 25 tests.
+- `pnpm --filter api build` passed.
+- Root `pnpm lint` passed.
+- Root `pnpm typecheck` passed.
+- Root `pnpm test` passed: API 7 suites/43 tests and worker 1 test.
+- Root `pnpm build` passed.
+- Live PostgreSQL/HTTP verification confirmed two concurrent sessions, safe
+  `/auth/me` responses, cookie clearing with past expiry, revoked-session
+  rejection, idempotent and missing-cookie logout, and that logging out one
+  session did not revoke the other.
+- The live test user and sessions were deleted after verification.
+- No schema change, migration, new dependency, JWT, Redis session store, or
+  workspace authorization was added.
+
+### Batch 7A: Authenticated workspace creation
+
+Status: **Completed for code, tests, and build verification.** Workspace
+creation was subsequently exercised against isolated PostgreSQL during Batch 7B
+live verification.
+
+Created:
+
+- `apps/api/src/workspaces/workspace.constants.ts`
+- `apps/api/src/workspaces/workspace-slug.ts`
+- `apps/api/src/workspaces/workspace-slug.spec.ts`
+- `apps/api/src/workspaces/workspace.types.ts`
+- `apps/api/src/workspaces/dto/create-workspace.dto.ts`
+- `apps/api/src/workspaces/workspaces.service.ts`
+- `apps/api/src/workspaces/workspaces.service.spec.ts`
+- `apps/api/src/workspaces/workspaces.controller.ts`
+- `apps/api/src/workspaces/workspaces.module.ts`
+- `apps/api/test/workspaces.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/app.module.ts`
+- `apps/api/src/auth/auth.module.ts` to make `SessionService` available to
+  modules that import the exported authentication guard
+
+Delivered:
+
+- Authenticated `POST /workspaces`
+- Name and optional nullable description validation with trimming, length limits,
+  and unknown-field rejection
+- Creator identity derived only from the authenticated session context
+- Atomic creation of the workspace and the creator's `OWNER` membership in one
+  Prisma transaction
+- Globally unique, schema-bounded slug generation from the workspace name
+- Generic `500` responses that do not expose database details
+- Safe creation responses containing workspace fields and the creator's role
+- Unit tests for slug generation and transactional creation behavior
+- HTTP tests for authentication, validation, ownership, rollback behavior, and
+  response safety
+
+Verification status:
+
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api test --runInBand` passed: 9 suites and 51 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 5 suites and 36 tests.
+- `pnpm --filter api build` passed.
+- Root `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm build` passed.
+- No schema change, migration, or new dependency was added.
+
+### Batch 7B: Workspace listing and retrieval
+
+Status: **Completed for code, tests, build, and isolated PostgreSQL verification.**
+The Docker Compose development database remains unmigrated and unverified.
+
+Created:
+
+- `apps/api/src/workspaces/dto/list-workspaces-query.dto.ts`
+- `apps/api/test/workspaces-list-retrieve.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/workspaces/workspace.constants.ts`
+- `apps/api/src/workspaces/workspace.types.ts`
+- `apps/api/src/workspaces/workspaces.controller.ts`
+- `apps/api/src/workspaces/workspaces.service.ts`
+- `apps/api/src/workspaces/workspaces.service.spec.ts`
+- `docs/API_CONTRACT.md`
+- `docs/ARCHITECTURE.md`
+- `docs/PROGRESS.md`
+
+Delivered:
+
+- Authenticated `GET /workspaces` returning only workspaces where the current
+  user has an active membership
+- Membership role included in each listing and retrieval response
+- Database-level membership filtering with no controller-side tenant filtering
+  and no N+1 relationship loading
+- Deterministic newest-first ordering by workspace `createdAt` with workspace ID
+  as a tie-breaker
+- Validated offset pagination with `page` and `limit`, defaults of `1` and `20`,
+  a maximum limit of `100`, and `total`/`totalPages` metadata
+- Authenticated `GET /workspaces/:id` with UUID validation and database-level
+  filtering by both authenticated user ID and workspace ID
+- Identical `404 Workspace not found.` responses for nonexistent and inaccessible
+  workspaces
+- Explicit safe response mapping for workspace ID, name, slug, description, role,
+  `createdAt`, and `updatedAt`
+- Unit tests for mapping, role inclusion, pagination, empty results, not-found
+  behavior, and generic failures
+- HTTP tests for authentication, tenant isolation, ordering, pagination,
+  invalid IDs, invalid query parameters, cross-user URL access, and response
+  safety
+
+Pagination decision:
+
+- Workspace listing uses validated offset pagination because a user's workspace
+  set is expected to be small. The general API convention still prefers cursor
+  pagination for larger collections.
+
+Verification status:
+
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api test --runInBand` passed: 9 suites and 58 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 6 suites and 47 tests.
+- `pnpm --filter api build` passed.
+- Root `pnpm lint` passed.
+- Root `pnpm typecheck` passed.
+- Root `pnpm test` passed: API 9 suites/58 tests and worker 1 test.
+- Root `pnpm build` passed.
+- Live isolated PostgreSQL/HTTP verification passed with two users and three
+  workspaces. It confirmed creation, owner memberships, newest-first listing,
+  pagination, cross-user isolation, 401/400/404 behavior, and safe response
+  fields. Test rows were deleted and the temporary PostgreSQL instance was
+  removed.
+- No schema change, migration, or new dependency was added.
+
+### Batch 7C: Workspace detail updates
+
+Status: **Completed for code, tests, lint, typecheck, and build verification.**
+The Docker Compose development database remains unmigrated and unverified.
+
+Created:
+
+- `apps/api/src/workspaces/dto/update-workspace.dto.ts`
+- `apps/api/test/workspaces-update.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/workspaces/workspace.constants.ts`
+- `apps/api/src/workspaces/workspaces.controller.ts`
+- `apps/api/src/workspaces/workspaces.service.ts`
+- `apps/api/src/workspaces/workspaces.service.spec.ts`
+- `docs/API_CONTRACT.md`
+- `docs/PROGRESS.md`
+
+Delivered:
+
+- Authenticated `PATCH /workspaces/:id`
+- Optional `name` and nullable `description` updates with trimming, length
+  limits, invalid-type rejection, and unknown-field rejection
+- At-least-one-field validation for update requests
+- Membership lookup and role authorization before the update, using only the
+  authenticated user's membership
+- `OWNER` and `ADMIN` updates allowed; `MEMBER` and `VIEWER` updates return `403`
+- Identical `404 Workspace not found.` responses for nonexistent and
+  inaccessible workspaces
+- `description: null` clears the description
+- Transactional membership check and workspace update
+- Safe response mapping consistent with workspace retrieval, including the
+  caller's membership role
+- Unit tests for owner and admin updates, description clearing, forbidden and
+  not-found cases, empty updates, and generic failures
+- HTTP tests for authentication, role authorization, tenant isolation, empty
+  bodies, invalid names and descriptions, unknown/protected fields, invalid IDs,
+  unchanged fields, and response safety
+
+Verification status:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand` passed: 9 suites and 64 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 7 suites and 60 tests.
+- `pnpm --filter api build` passed.
+- Root `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm build` passed.
+- No schema change, migration, or new dependency was added.
+
+### Batch 7D: Workspace deletion
+
+Status: **Completed for code, tests, lint, typecheck, build, and isolated live
+PostgreSQL verification.** The Docker Compose development database remains
+unmigrated and unverified.
+
+Created:
+
+- `apps/api/src/workspaces/workspaces-delete.service.spec.ts`
+- `apps/api/test/workspaces-delete.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/workspaces/workspace.constants.ts`
+- `apps/api/src/workspaces/workspaces.controller.ts`
+- `apps/api/src/workspaces/workspaces.service.ts`
+- `docs/API_CONTRACT.md`
+- `docs/DATABASE_DESIGN.md`
+- `docs/PROGRESS.md`
+
+Delivered:
+
+- Authenticated `DELETE /workspaces/:id` returning `204 No Content`
+- `OWNER`-only deletion; `ADMIN`, `MEMBER`, and `VIEWER` receive `403`
+- Identical `404 Workspace not found.` responses for nonexistent and inaccessible
+  workspaces
+- UUID validation through the existing route pipe
+- Transactional explicit purge in dependency order: webhook events,
+  recommendations, risk assessments, pull requests, issues, workflow runs,
+  repositories, the local GitHub installation record, projects, then the
+  workspace
+- Workspace-scoped deletion filters that preserve other tenants and unrelated
+  workspaces
+- Preservation of global users, sessions, and memberships in other workspaces
+- Cascade removal of the target workspace's memberships and invitations through
+  the existing schema
+- Generic `500 Unable to delete workspace.` responses with transaction rollback
+  on failure
+- No external GitHub App uninstallation and no schema change
+- Unit tests for owner deletion, deletion order, integration-free webhook scope,
+  admin/member denial, non-member not-found, and failed deletion
+- HTTP tests for authentication, authorization, nonexistent workspaces, invalid
+  IDs, related-record removal, tenant isolation, user/session preservation,
+  deleted-workspace retrieval, and rollback behavior
+
+Deletion decisions:
+
+- Workspace deletion is a deliberate permanent purge of workspace-owned data.
+  The database's restrictive foreign keys remain in place for direct database
+  operations.
+- Webhook events linked to the workspace, its installation, or its repositories
+  are deleted to avoid leaving orphaned rows.
+- The local GitHub installation record is deleted with the workspace. The
+  external GitHub App installation is not uninstalled and needs separate
+  operational cleanup.
+
+Verification status:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand` passed: 10 suites and 70 tests.
+- `pnpm --filter api test:e2e --runInBand` passed: 8 suites and 68 tests.
+- Root `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm build` passed.
+- Live isolated PostgreSQL verification passed: authorization responses,
+  complete workspace-owned-data purge, unrelated workspace/user/session/
+  membership preservation, and forced mid-transaction failure rollback.
+- No schema change, migration, or new dependency was added.
+
+### Batch 7E: Workspace ownership and membership integrity
+
+Status: **Completed.** The database now independently enforces the last-owner
+invariant, and the deferred ownership-transfer design is documented. Member
+management and ownership-transfer endpoints remain intentionally unimplemented.
+
+Created:
+
+- `packages/database/prisma/migrations/20261104100000_enforce_workspace_owner_invariants/migration.sql`
+- `packages/database/test/workspace-ownership.test.mjs`
+
+Modified:
+
+- `packages/database/prisma/schema.prisma` (invariant comment only)
+- `packages/database/package.json`
+- `docs/ARCHITECTURE.md`
+- `docs/API_CONTRACT.md`
+- `docs/DATABASE_DESIGN.md`
+- `docs/PROGRESS.md`
+
+Delivered:
+
+- Deferred constraint trigger requiring every committed workspace to have an
+  `OWNER`
+- Trigger rejecting deletion or demotion of the last `OWNER` while the workspace
+  still exists
+- Per-workspace transaction-scoped advisory lock to serialize concurrent owner
+  deletions/demotions
+- Migration guard that refuses to apply when existing data already contains an
+  ownerless workspace
+- Explicit allowance for workspace deletion cascades and documented blocking of
+  user deletion while the user is a last owner
+- Database integration tests for ownerless workspace commits, last-owner
+  protection, transactional ownership transfer ordering, bulk demotion/deletion,
+  concurrent demotions, concurrent owner deletions, and workspace-deletion
+  cascades
+- Documented intended ownership-transfer sequence; no endpoint was added
+- No new roles, invitations, member-management UI, authentication changes, or
+  new dependencies
+
+Verification status:
+
+- `pnpm --filter @devpulse/database migrate:deploy` passed against an isolated
+  temporary PostgreSQL database.
+- `pnpm --filter @devpulse/database test:integration` passed: 6 tests.
+- A manual migration guard test confirmed that an ownerless pre-existing
+  workspace prevents the migration from applying.
+- Live API verification confirmed workspace creation still creates exactly one
+  `OWNER` and workspace deletion still cascades through the protected membership
+  trigger.
+- `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build`, and
+  `pnpm --filter api test:e2e --runInBand` passed at Batch 7E completion.
+
+### Batch 8A: Project architecture and database relationship review
+
+Status: **Completed (design review only).** No project endpoints, Prisma schema
+changes, migrations, GitHub App code, or frontend code were added.
+
+Reviewed:
+
+- `Project`, `Repository`, `GitHubInstallation`, and workspace relationships
+- Existing workspace authentication, membership checks, role checks, and
+  cross-workspace isolation behavior
+- Project, repository, deletion, retention, roadmap, and API documentation
+
+Findings:
+
+- `Project.workspaceId` is required and protected by a restrictive foreign key.
+- `Repository.projectId` is required and unique, with a composite
+  `(projectId, workspaceId)` foreign key, so a repository cannot point at a
+  project in another workspace and a project cannot have multiple repositories.
+- A project can currently commit without a repository. The schema enforces
+  at-most-one, not exactly-one.
+- `Repository.githubId` is globally unique, so one GitHub repository cannot be
+  connected to multiple DevPulse projects or workspaces at the same time.
+- `Repository.installationId` does not include the workspace in its foreign key. A
+  direct database write can attach a repository in one workspace to an
+  installation in another workspace.
+- No reusable workspace-membership authorization helper exists; the workspace
+  service repeats the membership lookup itself.
+- No project API, repository-selection flow, or project lifecycle code exists.
+
+Design decisions recorded:
+
+- A Project is a minimal workspace-scoped container for exactly one connected
+  GitHub repository, not a general project-management system.
+- Project creation will be atomic with repository selection through the GitHub
+  App. Repo-less project creation is not part of the MVP.
+- Clients will not submit arbitrary repository metadata; canonical GitHub fields
+  are derived server-side from the selected repository.
+- `OWNER` and `ADMIN` may manage projects. `MEMBER` and `VIEWER` have read-only
+  project access. Non-members and cross-workspace projects return `404`.
+- Disconnecting a repository is separate from deleting a project. Deletion and
+  retention behavior requires approval.
+- Project deletion, if approved as permanent local deletion, should purge
+  project-owned webhook events, recommendations, risk assessments, pull requests,
+  issues, workflow runs, the repository, and the project in one transaction. It
+  must not delete the GitHub repository or uninstall the GitHub App.
+- `README.md`/API paths use the currently unprefixed `/workspaces` routes; project
+  paths are proposed under the same convention.
+
+Isolated PostgreSQL verification:
+
+- A project with no repository was accepted, confirming the exact-one invariant
+  is not yet enforced by the schema.
+- A repository in workspace A was accepted with a GitHub installation belonging
+  to workspace B, confirming the missing composite workspace constraint.
+- A second repository using the same `githubId` in another project/workspace was
+  rejected by `repositories_github_id_key`.
+
+Open approvals are listed in the Batch 8A final review. No verification claims
+are made for unimplemented project endpoints.
 
 ## Implemented repository state
 
@@ -475,10 +1049,18 @@ DevPulse/
 ├── packages/
 │   └── database/
 │       ├── prisma/
+│       │   ├── migrations/
+│       │   │   ├── 20261102064516_init_devpulse/
+│       │   │   │   └── migration.sql
+│       │   │   ├── 20261104100000_enforce_workspace_owner_invariants/
+│       │   │   │   └── migration.sql
+│       │   │   └── migration_lock.toml
 │       │   └── schema.prisma
 │       ├── src/
 │       │   ├── client.ts
 │       │   └── index.ts
+│       ├── test/
+│       │   └── workspace-ownership.test.mjs
 │       ├── package.json
 │       ├── prisma.config.ts
 │       ├── tsconfig.build.json
@@ -495,16 +1077,42 @@ DevPulse/
 The following do not exist yet:
 
 - `docker/`
-- Prisma migrations
 - Redis or BullMQ integration
+- Password reset and email verification flows
+- Member invitations, member management, role changes, ownership transfer, and
+  broader workspace RBAC
 
-## Open decisions
+## Decisions
+
+Resolved decisions:
+
+- Authentication uses database-backed server-side sessions. Login, current-user
+  lookup, session validation, and current-session logout are implemented.
+- Workspace creation derives the creator from the authenticated session and
+  atomically assigns the `OWNER` role.
+- Workspace listing, retrieval, and updates filter by active membership in the
+  database. Inaccessible and nonexistent workspaces both return `404`.
+- Workspace detail updates are restricted to `OWNER` and `ADMIN` members and only
+  change the name and description.
+- Workspace deletion is restricted to `OWNER` members and purges workspace-owned
+  data transactionally. It does not uninstall the external GitHub App
+  installation.
+- Every active workspace must retain at least one `OWNER`. Workspace creation
+  assigns it transactionally, and database triggers reject ownerless workspace
+  commits, last-owner deletion, and last-owner demotion. Concurrent changes are
+  serialized per workspace with an advisory lock.
+- Membership writes remain server-controlled. Request DTOs reject role,
+  membership, and `userId` fields; no membership-management endpoint exists.
+- Ownership transfer is deferred. Its required transactional ordering is
+  documented in `DATABASE_DESIGN.md`.
+- Workspace listing uses validated offset pagination because per-user workspace
+  sets are expected to be small.
+- GitHub integration uses a GitHub App.
 
 The following decisions remain open and must be resolved before the dependent
 phase begins:
 
-- GitHub App versus OAuth app
-- User authentication and session strategy
+- Password reset, email verification, session cleanup, and CSRF protection flows
 - Workspace role and permission matrix
 - Final MVP feature list
 - Deployment and CI metadata scope
@@ -514,7 +1122,7 @@ phase begins:
 - Repository disconnection, reconnection, and retention behavior
 - Invitation flow and whether email is always required
 - Recommendation category taxonomy
-- Enforcement of the at-least-one-workspace-owner invariant
+- Ownership-transfer endpoint behavior, audit trail, and authorization flow
 - Whether raw webhook payloads are ever retained
 - Enforcement of project-to-repository connectivity
 
@@ -523,8 +1131,15 @@ documents for details.
 
 ## Next step
 
-Await developer review of Batch 5C. A committed Prisma migration is required
-before the schema is used against a shared or production database; migration work
-was explicitly deferred for this batch. Do not begin migrations, seed data, Redis,
-BullMQ, or job processor implementation until the review is complete and the next
-batch is approved.
+Await developer approval of the Batch 8A project architecture review and its
+open decisions. No project-management endpoints were implemented. The existing
+workspace creation, listing, retrieval, updates, deletion, and database last-owner
+invariant remain implemented and verified. The Docker Compose development database
+remains unmigrated and unverified because Docker access is unavailable.
+
+Known outstanding work includes CSRF protection for cookie-authenticated
+state-changing requests, session cleanup for expired/revoked records, workspace
+invitations, member management, role changes, ownership transfer endpoints,
+broader RBAC, password reset, email verification, GitHub sign-in, project
+repository-selection and lifecycle flows, and external GitHub App uninstallation
+or cleanup for deleted workspaces.

@@ -96,6 +96,8 @@ Documentation:
 **Goal:** Allow users to authenticate and manage isolated workspaces and
 memberships.
 
+Selected approach: database-backed server-side sessions.
+
 Completion criteria:
 
 - Approved authentication flow is implemented.
@@ -123,7 +125,7 @@ repository metadata.
 
 Completion criteria:
 
-- GitHub App or OAuth decision is approved and implemented.
+- GitHub App integration is implemented.
 - Installation or authorization flow is complete.
 - Tokens remain server-side and are never returned to the browser.
 - Repository metadata synchronization works for approved fields.

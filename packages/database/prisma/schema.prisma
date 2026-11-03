@@ -1,8 +1,10 @@
 // DevPulse initial schema.
 //
-// Application-level invariant: every active workspace must retain at least one
-// OWNER membership. This is enforced transactionally by workspace services, not
-// by an ordinary Prisma relation or unique constraint.
+// Invariant: every active workspace must retain at least one OWNER membership.
+// Workspace creation enforces it transactionally, and database triggers added in
+// the enforce_workspace_owner_invariants migration protect it from concurrent
+// membership changes and direct database writes. Prisma relations and unique
+// constraints alone cannot express this invariant.
 
 datasource db {
   provider = "postgresql"

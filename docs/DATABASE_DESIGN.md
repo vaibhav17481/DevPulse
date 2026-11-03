@@ -4,12 +4,15 @@
 
 The initial PostgreSQL schema is implemented in
 `packages/database/prisma/schema.prisma` using Prisma 7.10.1. The schema is
-validated and the Prisma Client is generated, but no migration has been created
-or applied, and no runtime database integration has been verified.
+validated, the Prisma Client is generated, and the `init_devpulse` and
+`enforce_workspace_owner_invariants` migrations are committed. They were applied
+and verified against isolated PostgreSQL instances. The Docker Compose
+development database has not been migrated or verified because Docker access was
+unavailable.
 
 This document describes the implemented schema and the decisions that still
-require product or architecture approval. It must not be read as proof that
-migration or runtime database integration is complete.
+require product or architecture approval. It must not be read as proof that the
+Docker Compose development database is migrated or integrated.
 
 ## Implemented scope
 
@@ -86,9 +89,11 @@ Implemented fields include:
 A user can have many sessions and can belong to many workspaces through
 `WorkspaceMember`.
 
-The authentication strategy is still open. `passwordHash` and the GitHub identity
-fields are nullable so the schema does not prematurely force a single provider.
-Password hashes are stored instead of plaintext passwords.
+Email/password registration and login are implemented with database-backed
+server-side sessions. Session validation and logout are also implemented.
+`passwordHash` and the GitHub identity fields are nullable so the schema does not
+prematurely force a single provider. Passwords are hashed with Argon2id before
+storage; plaintext passwords are never stored.
 
 ### Session
 
@@ -104,6 +109,12 @@ Implemented fields include:
 
 Only a hash of the session credential is stored. Raw session tokens must never be
 persisted.
+
+Sessions have a fixed seven-day lifetime. Validation requires an unrevoked,
+unexpired session whose associated user still exists, and validation does not
+extend `expiresAt` or update `lastUsedAt`. Logout sets `revokedAt` on the session
+matching the current token hash only; it does not revoke the user's other
+sessions. These behaviors require no schema change.
 
 ### Workspace
 
@@ -125,12 +136,36 @@ assessments, and recommendations.
 
 Links a user to a workspace and records their role.
 
-Uniqueness: one membership per `(workspaceId, userId)`.
+Uniqueness: one membership per `(workspaceId, userId)`. There is no separate
+active flag; the presence of the row is the membership. Removing the row removes
+workspace access.
 
-Every active workspace must retain at least one `OWNER`. This is an
-application-level transactional invariant, not a database constraint. Ordinary
-foreign keys and unique constraints cannot guarantee it across membership
-changes, ownership transfer, and user deletion.
+Every active workspace must retain at least one `OWNER`. Workspace creation
+enforces this by inserting the workspace and the creator's `OWNER` membership in
+one transaction. The `enforce_workspace_owner_invariants` migration adds two
+database triggers for the remaining paths:
+
+- A deferred constraint trigger rejects a committed workspace insert that has no
+  `OWNER`. The trigger runs at transaction commit, so the normal workspace plus
+  owner creation transaction succeeds.
+- A `BEFORE DELETE OR UPDATE OF role` trigger rejects deleting or demoting the
+  last `OWNER` while the workspace still exists. Workspace deletion is allowed
+  because the parent workspace row is already removed when cascading membership
+  deletes run.
+
+The membership trigger acquires a transaction-scoped advisory lock keyed by the
+workspace before counting other owners. Concurrent demotions or deletions of
+different owners are therefore serialized; after the first transaction commits,
+the second rechecks and is rejected if no owner remains. A hash collision can
+serialize unrelated workspaces, but cannot weaken the invariant. This protection
+is enforced by PostgreSQL under its default `READ COMMITTED` isolation. Higher
+isolation levels may abort a conflicting transaction instead of allowing it to
+proceed, but must not permit a zero-owner commit.
+
+The trigger enforces data integrity, not actor authorization. Application code
+must still verify that the authenticated user is permitted to change membership.
+Current API code has no membership-management or ownership-transfer endpoint, so
+the only supported membership write is `OWNER` assignment during creation.
 
 ### WorkspaceInvitation
 
@@ -151,24 +186,60 @@ Implemented fields include:
 Only a hash of the invitation token is stored. The final invitation flow,
 including whether email is always required, remains open.
 
+### Ownership transfer (planned)
+
+Ownership transfer is not implemented and has no endpoint. The intended safe
+design is one transaction that:
+
+1. Resolves the actor from the authenticated session and verifies that the actor
+   is an authenticated `OWNER` of the workspace.
+2. Locks the workspace or otherwise serializes membership changes for that
+   workspace.
+3. Promotes or adds the new `OWNER`.
+4. Demotes or removes the previous `OWNER` only after the new ownership row is
+   visible in the same transaction.
+
+The database trigger still validates the final state and rejects any transaction
+that would leave zero owners. Promoting the new owner before demoting the old
+owner is required; the reverse order is rejected. The trigger does not replace
+the actor authorization check.
+
 ### Project
 
-Represents a DevPulse project within exactly one workspace.
+Represents a minimal DevPulse project within exactly one workspace. A project is
+a container for one connected GitHub repository, not a task tracker or general
+project-management record.
 
 Implemented fields include:
 
 - Internal UUID
-- Owning workspace
+- Owning workspace, required
 - Name
 - Slug unique within the workspace
 - Optional description
 - Internal timestamps
 
-A project has at most one connected repository in the implemented schema. The
-database enforces that a repository belongs to only one project and that a
-project cannot own multiple repositories. The database cannot enforce that every
-project has a repository at all times; that is an application-level invariant
-until the repository connection workflow is implemented.
+The minimum MVP fields are the UUID, owning workspace, name, optional
+description, and internal timestamps. The repository relationship is stored on
+`Repository.projectId`, so no duplicate `Project.repositoryId` field is needed.
+No project status field is recommended: repository connection state already
+belongs to `Repository` and duplicating it on `Project` would create two sources
+of truth. `Project.slug` is not required by the UUID-based MVP API; keeping or
+removing it requires approval before the project API is implemented.
+
+The target invariant is that every project has exactly one connected repository.
+The implemented schema enforces the inverse side (one repository per project) and
+at most one repository per project, but it currently allows a project with no
+repository. The database cannot enforce the parent-requires-child side without a
+deferred constraint trigger or an equivalent transactional invariant. Project
+creation should therefore create the project and repository atomically; if the
+exact-one rule is retained, a future migration should add a deferred trigger that
+rejects committing a project without a repository.
+
+A project-without-repository state is not part of the MVP. It would add empty
+states, duplicate lifecycle rules, and permit repository ownership to remain
+ambiguous. Project creation should wait for repository selection through the
+GitHub App and insert both records in one transaction.
 
 ### GitHubInstallation
 
@@ -207,14 +278,24 @@ Implemented fields include:
 - Connected and last synchronization timestamps
 - Internal timestamps
 
-The GitHub repository identifier is globally unique. If disconnected repository
-records are retained, reconnecting the same GitHub repository must reuse the
-existing record. Reconnection to a different project or workspace remains an
-open decision.
+The GitHub repository identifier is globally unique. A GitHub repository may
+therefore be connected to only one DevPulse project at a time. If disconnected
+repository records are retained, the existing record remains attached to its
+project and must be reused for reconnection. Reassigning a disconnected
+repository to another project or workspace is not part of the MVP and remains an
+open decision; the global uniqueness constraint prevents simultaneous sharing but
+does not by itself define transfer behavior.
+
+A repository's installation is required, but the implemented foreign key checks
+only `installationId`. It does not ensure that the installation belongs to the
+repository's `workspaceId`. Application code must validate this today, and a
+future migration should add a composite installation/workspace foreign key so a
+repository cannot reference another workspace's installation.
 
 Disconnection changes `connectionStatus` and `disconnectedAt`; it does not delete
-the repository or its historical activity. Repository data deletion is a separate
-operation.
+the repository or its historical activity, and it does not delete the project.
+Repository data deletion and project deletion are separate operations requiring
+an approved lifecycle and retention decision.
 
 ### WebhookEvent
 
@@ -349,9 +430,12 @@ enum.
 - A workspace has many repositories, webhook events, pull requests, issues,
   workflow runs, risk assessments, and recommendations.
 - A project belongs to exactly one workspace.
-- A project has at most one repository.
+- A project is intended to have exactly one repository; the schema currently
+  enforces at most one and allows zero until the application or a future trigger
+  closes that gap.
 - A repository belongs to exactly one project and one workspace.
-- A repository belongs to one GitHub installation.
+- A repository belongs to one GitHub installation, which must belong to the same
+  workspace. The latter consistency rule is not currently enforced by the schema.
 - A repository has many pull requests, issues, workflow runs, and webhook events.
 - A webhook event may reference an installation, a repository, and a workspace.
 - A project has many risk assessments and recommendations.
@@ -372,6 +456,13 @@ consistency rules with composite foreign keys:
 These constraints prevent a child record from pointing at a parent in a different
 workspace even if application code supplies inconsistent identifiers.
 
+`Repository.installationId` is not yet part of a composite workspace constraint.
+A direct database write can currently attach a repository in workspace A to an
+installation in workspace B. Application code must reject that combination today.
+The recommended Phase 8B migration is to add a unique `(id, workspaceId)` key to
+`GitHubInstallation` and reference `(installationId, workspaceId)` from
+`Repository`.
+
 `WebhookEvent` uses optional direct references because a delivery may arrive
 before its installation or repository is known. The application must keep its
 optional workspace reference consistent with known installation and repository
@@ -382,7 +473,8 @@ Application-level requirements remain:
 - Every workspace-scoped API operation must verify membership.
 - Queries must include a workspace constraint.
 - Cross-workspace references must be rejected and tested.
-- The at-least-one-owner rule must be enforced transactionally.
+- The at-least-one-owner rule is enforced by application transactions for creation
+  and by database triggers for last-owner deletion/demotion and ownerless commits.
 - Webhook event workspace consistency must be validated when references are
   resolved.
 - Recommendation-to-risk-assessment consistency must be validated.
@@ -441,14 +533,20 @@ Examples:
 Authentication and membership artifacts use cascading deletion where the child
 record has no meaning without the parent:
 
-- Deleting a user cascades their sessions and workspace memberships.
-- Deleting a workspace cascades memberships and invitations.
+- Deleting a user cascades their sessions and workspace memberships. A user who
+  is the last `OWNER` of any workspace cannot be deleted until ownership is
+  transferred or the workspace is deleted, because the cascading membership
+  delete is rejected by the last-owner trigger. There is currently no user
+  deletion endpoint.
+- Deleting a workspace cascades memberships and invitations. The last-owner
+  trigger permits this path because the workspace row is removed first.
 
 Historical and integration records use restrictive deletion to avoid accidental
-loss:
+loss during direct database operations:
 
 - A workspace with projects, repositories, an installation, risk assessments, or
-  recommendations cannot be deleted until those records are handled explicitly.
+  recommendations cannot be deleted by a plain database delete until those
+  records are handled explicitly.
 - A project with a repository, risk assessments, or recommendations cannot be
   deleted until those records are handled explicitly.
 - An installation with repositories cannot be deleted until the repositories are
@@ -465,13 +563,65 @@ Nullable references use `SetNull`:
 Deleting a risk assessment therefore clears the optional recommendation
 reference rather than deleting the recommendation.
 
-These choices keep repository disconnection separate from repository data
-deletion. They also avoid indiscriminate cascade deletion of historical
-engineering activity.
+### Workspace deletion endpoint
 
-Retention periods are not defined in this batch. Product-level approval is still
-required for raw webhook metadata, repository activity, risk evidence, and
-recommendations.
+`DELETE /workspaces/:id` intentionally bypasses the restrictive behavior by
+purging workspace-owned records explicitly inside one transaction, in dependency
+order:
+
+1. Webhook events linked to the workspace, its installation, or its repositories
+2. Recommendations
+3. Risk assessments
+4. Pull requests
+5. Issues
+6. Workflow runs
+7. Repositories
+8. The local GitHub installation record
+9. Projects
+10. The workspace itself
+
+Workspace memberships and invitations are removed by the existing cascading
+foreign keys when the workspace is deleted. Every deletion is scoped to the
+target workspace or to IDs belonging to that workspace, so unrelated workspaces
+and other tenants are not affected. Global users, their sessions, and their
+memberships in other workspaces are never deleted.
+
+The GitHub App installation is not uninstalled through GitHub's external API.
+Deleting the workspace removes only the local DevPulse installation record, so
+external installation cleanup remains a separate operational task.
+
+This workspace-deletion path is a deliberate permanent purge. It keeps repository
+disconnection separate from repository data deletion while avoiding orphaned
+workspace-owned rows. Retention periods for non-deletion flows, disconnected
+repositories, and other historical data remain undefined and still require
+product-level approval.
+
+### Project deletion (proposed, requires approval)
+
+Repository disconnection and project deletion are different actions:
+
+- Disconnecting a repository changes its connection state, stops active
+  synchronization, and retains the project plus historical activity.
+- Deleting a project is a permanent local deletion of the project aggregate. It
+  must not delete or modify the repository on GitHub and must not uninstall the
+  workspace's GitHub App installation.
+
+If permanent project deletion is approved, the recommended transaction is:
+
+1. Verify the authenticated actor's `OWNER` or `ADMIN` membership.
+2. Resolve the project by both `projectId` and `workspaceId`.
+3. Delete webhook events linked to the project's repository.
+4. Delete the project's recommendations and risk assessments.
+5. Delete pull requests, issues, and workflow runs for the repository.
+6. Delete the repository record.
+7. Delete the project record.
+
+This matches the workspace deletion purge order and leaves other projects,
+workspace memberships, the GitHub installation, and external GitHub data intact.
+Deleting the repository record releases its global GitHub identifier for a future
+connection; that consequence requires explicit approval. If retention is required
+instead, project deletion must use a softer archive/retention model and must not
+use this purge.
 
 ## Webhook processing design
 
@@ -525,8 +675,11 @@ requirements favor extracting only required fields at ingestion time.
 
 The following cannot be guaranteed by the implemented Prisma schema alone:
 
-- Every active workspace has at least one `OWNER`.
-- Every project has a connected repository.
+- Every project has a connected repository. The schema currently allows zero or
+  one; project creation must be atomic, and a future deferred trigger should
+  enforce exactly one if the MVP keeps that rule.
+- A repository's installation belongs to the same workspace as the repository.
+  This gap should be closed by a composite foreign key in Phase 8B.
 - A webhook event's optional workspace reference matches its installation and
   repository references when those are known.
 - A recommendation's risk assessment belongs to the same project and workspace.
@@ -535,18 +688,42 @@ The following cannot be guaranteed by the implemented Prisma schema alone:
 
 ## Migration status
 
-The schema is validated and the Prisma Client generates successfully. No migration
-has been created or applied because Batch 5C explicitly defers migration work.
-This conflicts with the general repository rule that every schema change must use
-a committed Prisma migration; the migration remains a required follow-up before
-the schema is used against a shared or production database.
+Batch 5C deferred migration work. Batch 6B created and committed the initial
+`init_devpulse` migration and verified it against an isolated PostgreSQL instance.
+Batch 7E added the `enforce_workspace_owner_invariants` migration and verified it
+against an isolated PostgreSQL instance. The Docker Compose development database
+still requires both migrations to be applied, and no shared or production
+database has been migrated.
+
+## Resolved decisions
+
+- Authentication uses database-backed server-side sessions. Session creation,
+  validation, and current-session revocation are implemented; expired/revoked
+  session cleanup remains pending.
+- GitHub integration uses a GitHub App.
+- Every active workspace retains at least one `OWNER`. Creation assigns it
+  transactionally; deferred and last-owner triggers reject ownerless workspace
+  commits, last-owner deletion, and last-owner demotion. Concurrent changes are
+  serialized per workspace with an advisory lock.
+- Request DTOs reject membership role, `userId`, and membership fields. Role
+  assignment is server-controlled.
+- Workspace memberships are active by row presence; no soft-delete state exists.
+- Ownership transfer is deferred and has no endpoint. Its transactional design is
+  documented above.
+- A Project is a minimal workspace-scoped container for exactly one connected
+  GitHub repository, not a general project-management record.
+- A GitHub repository cannot be connected to multiple projects or workspaces at
+  the same time. Disconnected repository records remain attached to their existing
+  project unless a future transfer flow is approved.
+- Project creation waits for repository selection through the GitHub App and
+  creates the project and repository atomically. A repo-less project creation
+  state is not part of the MVP.
 
 ## Open decisions
 
-- Final authentication and session strategy
 - Final role and permission matrix
 - Invitation flow and whether email is always required
-- GitHub App versus OAuth app and credential storage design
+- GitHub App permissions and credential storage design
 - Repository reconnection behavior after disconnection
 - Whether disconnected repository records are retained indefinitely
 - Retention periods for webhook events, engineering activity, evidence, and
@@ -554,5 +731,13 @@ the schema is used against a shared or production database.
 - Recommendation category taxonomy
 - Whether PostgreSQL row-level security is required
 - Whether raw webhook payloads are ever retained
-- How the at-least-one-owner invariant is enforced transactionally
-- How project-to-repository connectivity is enforced as an application invariant
+- Ownership-transfer endpoint behavior, audit trail, and authorization flow
+- Whether the exact-one project-to-repository rule is enforced by a deferred
+  database trigger in addition to atomic application creation
+- Whether `Project.slug` is retained or removed before the project API is
+  implemented
+- Whether project deletion permanently purges local repository metadata and
+  history or uses a retention/archive model
+- Whether disconnected repositories may ever be reassigned to another project or
+  workspace
+- Whether archived GitHub repositories may be newly connected to a project

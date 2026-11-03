@@ -7,9 +7,11 @@ pnpm monorepo and is being built in small, tested milestones.
 
 The repository contains the root pnpm workspace foundation, local Docker
 infrastructure for PostgreSQL and Redis, the Next.js frontend scaffold in
-`apps/web`, the NestJS API scaffold in `apps/api`, and the independent worker
-scaffold in `apps/worker`. Shared packages, Prisma schema, BullMQ job processing,
-and deployment configuration have not been implemented yet.
+`apps/web`, the NestJS API with email/password registration in `apps/api`, the
+independent worker scaffold in `apps/worker`, and the Prisma schema and initial
+migration in `packages/database`. Login, logout, sessions, workspace
+authorization, BullMQ job processing, and deployment configuration have not been
+implemented yet.
 
 ## Planned architecture
 
@@ -31,7 +33,7 @@ DevPulse/
 - apps/api/          # NestJS HTTP API
 - apps/worker/       # independent Node.js background worker
 - apps/web/          # Next.js frontend
-- packages/          # reusable internal packages (planned)
+- packages/database/ # Prisma schema, migrations, and client access
 - docs/              # project documentation
 - docker-compose.yml # local PostgreSQL and Redis services
 - .env.example       # local environment variable template
@@ -181,6 +183,24 @@ pnpm --filter api typecheck
 pnpm --filter api test
 pnpm --filter api test:e2e
 pnpm --filter api build
+```
+
+### Database migrations
+
+The API requires `DATABASE_URL` from the root `.env`. The initial
+`init_devpulse` migration is committed. Apply it to the configured development
+database before starting the API:
+
+```bash
+pnpm --filter @devpulse/database migrate:deploy
+pnpm --filter @devpulse/database migrate:status
+```
+
+For new local schema changes, use the Prisma development workflow with a
+descriptive migration name:
+
+```bash
+pnpm --filter @devpulse/database exec prisma migrate dev --name <migration_name>
 ```
 
 ## Worker

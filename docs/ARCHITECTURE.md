@@ -4,8 +4,13 @@
 
 This document records the approved architecture direction and separates what is
 implemented from what is planned. The repository currently contains the root pnpm
-workspace, the application scaffolds, and the Prisma database package. PostgreSQL
-runtime integration, Redis, and BullMQ are not implemented yet.
+workspace, the application scaffolds, the Prisma database package, the initial
+schema and migration, and email/password authentication with database-backed
+sessions. Registration, login, current-user lookup, session validation, logout,
+workspace creation, and membership-filtered workspace listing and retrieval are
+implemented. PostgreSQL persistence has been verified against isolated PostgreSQL
+instances. The Docker Compose development database, Redis, and BullMQ are not
+implemented or verified yet.
 
 ## Architecture summary
 
@@ -34,7 +39,7 @@ This is not a microservice architecture:
 | `apps/api` | NestJS HTTP API and BullMQ job producer | Implemented scaffold |
 | `apps/worker` | BullMQ consumers and scheduled work | Implemented scaffold |
 | `packages/shared` | Framework-agnostic types, constants, and pure utilities | Planned |
-| `packages/database` | Prisma schema, migrations, and database client access | Implemented: initial schema; no migration |
+| `packages/database` | Prisma schema, migrations, and database client access | Implemented: initial schema and `init_devpulse` migration |
 | `packages/core` | Shared business use cases; created only when needed | Planned |
 | `docs/` | Project documentation | In progress |
 | `docker/` | Local infrastructure and deployment configuration | Planned |
@@ -54,6 +59,10 @@ This is not a microservice architecture:
 - Exposes the public HTTP API using NestJS.
 - Handles authentication, authorization, request validation, and response
   shaping.
+- Validates opaque session cookies through a reusable authentication guard and
+  exposes only a safe authenticated user identity to controllers.
+- Filters workspace listing and retrieval by authenticated membership in the
+  database query and maps records to safe API responses.
 - Owns HTTP-specific concerns such as controllers, guards, and interceptors.
 - Reads and writes application data through `packages/database` or business use
   cases in `packages/core`.
@@ -82,8 +91,11 @@ This is not a microservice architecture:
   worker TypeScript builds.
 - The package exports a single client factory. Each process creates one client and
   owns its connection and shutdown lifecycle.
-- Initial application models are defined in the package schema. No migration has
-  been created or applied yet.
+- Initial application models are defined in the package schema. The
+  `init_devpulse` migration is committed, was applied during verification against
+  an isolated PostgreSQL instance, and is verified as up to date there. The Docker
+  Compose development database still needs the migration applied once Docker
+  access is available.
 - No application or other package maintains a separate Prisma schema.
 - The GitHub external repository identifier is stored and protected by a
   uniqueness constraint that prevents the same repository from being actively
@@ -177,7 +189,8 @@ architectural requirement:
 - A GitHub repository cannot be actively connected to multiple Projects or
   Workspaces in the MVP.
 - Every workspace-scoped API operation must verify membership before reading or
-  writing data.
+  writing data. Workspace listing and retrieval currently enforce this in the
+  database query and return `404` for nonexistent or inaccessible workspaces.
 - Queries must include a workspace constraint rather than filtering after fetch.
 - Unique constraints should include the workspace where collisions would
   otherwise cross tenant boundaries, except for the GitHub external repository
@@ -189,6 +202,75 @@ architectural requirement:
 The exact enforcement mechanism, including whether database row-level security is
 used in addition to application checks, remains open.
 
+## Workspace ownership and membership integrity
+
+- The supported roles remain `OWNER`, `ADMIN`, `MEMBER`, and `VIEWER`; no new
+  roles are introduced.
+- Workspace creation derives the creator from the authenticated session and
+  atomically inserts the workspace plus an `OWNER` membership.
+- Workspace access is based on the existence of the membership row. There is no
+  soft-deleted membership state, so removing a row removes access.
+- Request DTOs do not accept `userId`, `role`, or membership fields. Role
+  assignment is server-controlled; ordinary workspace create and update requests
+  cannot choose a role.
+- The database enforces the last-owner invariant with a deferred workspace-owner
+  trigger and a membership delete/demotion trigger. The membership trigger uses a
+  per-workspace advisory lock so concurrent changes are serialized rather than
+  relying only on an application-level check.
+- The database trigger does not authenticate or authorize the actor. Application
+  services must still verify session identity and owner permission.
+- Member management, role changes, invitations, and ownership transfer are not
+  implemented. The intended ownership-transfer sequence is documented in
+  `DATABASE_DESIGN.md`; it must promote the new owner before demoting the old
+  owner in one transaction.
+
+## Project lifecycle and repository ownership
+
+A DevPulse Project is a minimal workspace-scoped container for one connected
+GitHub repository. It is not a task tracker, issue board, or general
+project-management system.
+
+The target MVP invariant is: one Project belongs to exactly one Workspace and is
+connected to exactly one GitHub Repository. The implemented schema enforces the
+workspace relationship, at most one repository per project, and the repository's
+workspace matching its project's workspace. It does not yet enforce that a
+project has a repository at commit time, and a Repository's installation is not
+constrained to the same workspace. Those are implementation gaps to close before
+project write endpoints are exposed.
+
+Project creation is planned as one atomic operation after repository selection
+through the GitHub App. The API will resolve the repository from the workspace's
+active installation and derive canonical GitHub metadata server-side. It will not
+accept a project without a repository, and clients will not submit repository
+owner names, URLs, visibility, or other GitHub metadata manually. A
+project-without-repository state is not needed for the MVP and would add an empty
+state, duplicate lifecycle rules, and ambiguous repository ownership.
+
+A GitHub repository may be connected to only one DevPulse project at a time. The
+global `githubId` uniqueness constraint enforces this. A disconnected repository
+remains attached to its existing project so its history and identity remain
+consistent; it cannot simultaneously appear in another project or workspace.
+Reassigning a repository to another project or workspace requires an explicit
+future transfer decision and is not part of the MVP.
+
+Repository disconnection is not project deletion. Disconnection stops active
+synchronization and records the disconnection timestamp while retaining the
+project and historical metadata. Project deletion is a separate, explicit
+permanent local purge that must not delete or modify the repository on GitHub.
+The final deletion/retention behavior requires product approval before
+implementation.
+
+Project authorization is workspace-scoped:
+
+| Operation | OWNER | ADMIN | MEMBER | VIEWER | Non-member |
+| --- | --- | --- | --- | --- | --- |
+| List/read projects | Allowed | Allowed | Allowed | Allowed | `404` |
+| Create/update/delete projects | Allowed | Allowed | `403` | `403` | `404` |
+
+`MEMBER` and `VIEWER` are read-only for project-management operations. Project
+queries must include the workspace constraint and must return `404` for
+nonexistent and cross-workspace projects.
+
 ## Implemented versus planned
 
 | Capability | Status |
@@ -198,20 +280,54 @@ used in addition to application checks, remains open.
 | Next.js application | Implemented scaffold |
 | NestJS API application | Implemented scaffold |
 | Independent worker application | Implemented scaffold |
-| PostgreSQL and Prisma setup | In progress: database package and initial schema added; no migration applied |
+| PostgreSQL and Prisma setup | In progress: database package, initial schema, `init_devpulse` migration, and `enforce_workspace_owner_invariants` migration added; live persistence and ownership triggers verified on isolated PostgreSQL instances; Compose development database pending |
 | Redis and BullMQ setup | Planned |
-| Authentication and workspace authorization | Planned |
+| Authentication and workspace authorization | In progress: email/password registration, login, database-backed sessions, session validation, current-user lookup, logout, workspace creation, membership-filtered workspace listing/retrieval/updates, owner-only deletion, and database-enforced last-owner protection implemented; member management, invitations, role changes, ownership transfer, and broader RBAC planned |
+| Project management | Planned: schema supports workspace-scoped projects and one repository per project; Phase 8A completed the design review, but no project endpoints, repository-selection flow, or lifecycle operations are implemented |
 | GitHub metadata integration | Planned |
 
-## Open architecture decisions
+## Architecture decisions
 
-- Whether GitHub integration uses a GitHub App, OAuth app, or both
-- Authentication mechanism for DevPulse users
+Selected decisions:
+
+- GitHub integration uses a GitHub App.
+- Authentication uses database-backed server-side sessions. Login creates a
+  seven-day session whose raw token is carried only in an HTTP-only cookie and
+  whose SHA-256 hash is stored in PostgreSQL. Session validation does not extend
+  expiration, and logout revokes only the current session.
+- Workspace creation derives the creator from the authenticated session and
+  atomically creates the workspace and an `OWNER` membership.
+- Workspace listing and retrieval filter by active membership in the database.
+  Inaccessible and nonexistent workspaces both return `404`.
+- The last-owner invariant is enforced by PostgreSQL triggers in addition to
+  application transactions. Concurrent membership changes are serialized with a
+  per-workspace advisory lock.
+- Workspace listing uses validated offset pagination because per-user workspace
+  sets are expected to be small; cursor pagination remains preferred for larger
+  collections.
+- Projects are minimal workspace-scoped containers for exactly one GitHub
+  repository. They are not general project-management records. Project creation
+  will be atomic with repository selection from an active GitHub installation;
+  repo-less project creation is not part of the MVP.
+- `MEMBER` and `VIEWER` are read-only for project-management operations.
+  `OWNER` and `ADMIN` may create, update, and delete projects.
+- Repository disconnection is separate from project deletion. Reassigning a
+  repository between projects or workspaces is not supported in the MVP.
+
+Open decisions:
+
 - Exact job contracts, retry policy, and dead-letter handling
 - How webhooks are received and verified
 - Whether metrics are computed on demand or materialized by scheduled jobs
 - Repository reconnection behavior after disconnection and how retained
   historical data is handled
+- Whether project deletion permanently purges local repository/history records or
+  retains them under a future retention policy
+- Whether disconnected repository records may ever be reassigned to another
+  project or workspace
+- Whether `Project.slug` remains necessary after the UUID-based API is finalized
+- The minimum GitHub permissions and repository-discovery flow required before
+  project creation can be implemented
 - Deployment topology and hosting provider
 - Whether database row-level security is required in addition to application
   authorization
