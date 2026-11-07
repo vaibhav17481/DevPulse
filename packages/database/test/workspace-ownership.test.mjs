@@ -44,8 +44,10 @@ function uniqueIds() {
     userOne: randomUUID(),
     userTwo: randomUUID(),
     workspace: randomUUID(),
+    workspaceTwo: randomUUID(),
     membershipOne: randomUUID(),
     membershipTwo: randomUUID(),
+    membershipThree: randomUUID(),
   };
 }
 
@@ -95,11 +97,40 @@ async function insertWorkspaceWithOwners(client, ids, ownerCount = 2) {
   }
 }
 
+async function insertWorkspaceWithExistingOwner(
+  client,
+  workspaceId,
+  userId,
+  membershipId,
+) {
+  await client.query('BEGIN');
+
+  try {
+    await client.query(
+      `INSERT INTO "workspaces" ("id", "name", "slug", "updated_at")
+       VALUES ($1, 'Ownership test', $2, now())`,
+      [workspaceId, `ownership-${workspaceId}`],
+    );
+    await client.query(
+      `INSERT INTO "workspace_members"
+         ("id", "workspace_id", "user_id", "role", "updated_at")
+       VALUES ($1, $2, $3, 'OWNER', now())`,
+      [membershipId, workspaceId, userId],
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+}
+
 async function cleanup(ids) {
   await withClient(async (client) => {
-    await client.query('DELETE FROM "workspaces" WHERE "id" = $1', [
-      ids.workspace,
-    ]);
+    await client.query(
+      'DELETE FROM "workspaces" WHERE "id" = ANY($1::uuid[])',
+      [[ids.workspace, ids.workspaceTwo]],
+    );
     await client.query('DELETE FROM "users" WHERE "id" = ANY($1::uuid[])', [
       [ids.userOne, ids.userTwo],
     ]);
@@ -199,6 +230,114 @@ test(
 
         assert.equal(await countOwners(ids.workspace), 1);
       });
+    } finally {
+      await cleanup(ids);
+    }
+  },
+);
+
+test(
+  'rejects moving the only OWNER to another workspace',
+  { skip },
+  async () => {
+    const ids = uniqueIds();
+
+    try {
+      await withClient(async (client) => {
+        await insertWorkspaceWithOwners(client, ids, 1);
+        await insertWorkspaceWithExistingOwner(
+          client,
+          ids.workspaceTwo,
+          ids.userTwo,
+          ids.membershipTwo,
+        );
+
+        await assert.rejects(
+          client.query(
+            'UPDATE "workspace_members" SET "workspace_id" = $1 WHERE "id" = $2',
+            [ids.workspaceTwo, ids.membershipOne],
+          ),
+          /must retain at least one OWNER/,
+        );
+      });
+
+      assert.equal(await countOwners(ids.workspace), 1);
+      assert.equal(await countOwners(ids.workspaceTwo), 1);
+    } finally {
+      await cleanup(ids);
+    }
+  },
+);
+
+test(
+  'allows moving one of multiple OWNERS to another workspace',
+  { skip },
+  async () => {
+    const ids = uniqueIds();
+
+    try {
+      await withClient(async (client) => {
+        await insertWorkspaceWithOwners(client, ids, 2);
+        await insertWorkspaceWithExistingOwner(
+          client,
+          ids.workspaceTwo,
+          ids.userOne,
+          ids.membershipThree,
+        );
+
+        await client.query(
+          'UPDATE "workspace_members" SET "workspace_id" = $1 WHERE "id" = $2',
+          [ids.workspaceTwo, ids.membershipTwo],
+        );
+
+        const moved = await client.query(
+          'SELECT "workspace_id" FROM "workspace_members" WHERE "id" = $1',
+          [ids.membershipTwo],
+        );
+        assert.equal(moved.rows[0].workspace_id, ids.workspaceTwo);
+      });
+
+      assert.equal(await countOwners(ids.workspace), 1);
+      assert.equal(await countOwners(ids.workspaceTwo), 2);
+    } finally {
+      await cleanup(ids);
+    }
+  },
+);
+
+test(
+  'leaves ordinary membership updates unaffected',
+  { skip },
+  async () => {
+    const ids = uniqueIds();
+
+    try {
+      await withClient(async (client) => {
+        await insertWorkspaceWithOwners(client, ids, 2);
+
+        await client.query(
+          'UPDATE "workspace_members" SET "updated_at" = now() WHERE "id" = $1',
+          [ids.membershipOne],
+        );
+        await client.query(
+          `UPDATE "workspace_members" SET "role" = 'OWNER' WHERE "id" = $1`,
+          [ids.membershipOne],
+        );
+        await client.query(
+          `UPDATE "workspace_members"
+           SET "role" = 'ADMIN', "updated_at" = now()
+           WHERE "id" = $1`,
+          [ids.membershipTwo],
+        );
+        await client.query(
+          `UPDATE "workspace_members"
+           SET "role" = 'MEMBER', "updated_at" = now()
+           WHERE "id" = $1`,
+          [ids.membershipTwo],
+        );
+      });
+
+      assert.equal(await countOwners(ids.workspace), 1);
     } finally {
       await cleanup(ids);
     }

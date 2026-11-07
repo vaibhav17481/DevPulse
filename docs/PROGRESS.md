@@ -1,6 +1,6 @@
 # DevPulse Progress
 
-Last updated: 2026-11-04
+Last updated: 2026-11-05
 
 ## Status legend
 
@@ -14,9 +14,9 @@ Last updated: 2026-11-04
 | Phase | Status | Notes |
 | --- | --- | --- |
 | Phase 1: Foundation and Documentation | Completed | Batches 1 and 2 complete |
-| Phase 2: Local Infrastructure and Database Foundation | In progress | Batch 3 adds local PostgreSQL and Redis; Batch 5B adds the Prisma 7 database package; Batch 5C adds the initial schema; Batch 6B adds the `init_devpulse` migration; Batches 6C and 6D verify authentication and session flows, and Batches 7B through 7D verify workspace creation, listing, retrieval, updates, and deletion on isolated PostgreSQL instances; Batch 7E adds database-enforced workspace ownership invariants and an integration test. The Docker Compose development database is not migrated or verified |
+| Phase 2: Local Infrastructure and Database Foundation | In progress | Batch 3 adds local PostgreSQL and Redis; Batch 5B adds the Prisma 7 database package; Batch 5C adds the initial schema; Batch 6B adds the `init_devpulse` migration; Batches 6C and 6D verify authentication and session flows, and Batches 7B through 7D verify workspace creation, listing, retrieval, updates, and deletion on isolated PostgreSQL instances; Batch 7E adds database-enforced workspace ownership invariants and an integration test. Batch 8G adds PostgreSQL integration tests for existing project/repository workspace constraints. The Docker Compose development database is not migrated or verified |
 | Phase 3: Shared Contracts and Core Skeleton | Not started | No `packages/shared` or `packages/core` yet |
-| Phase 4: Authentication and Workspace Management | In progress | Batch 6D adds login, database-backed session validation, an authentication guard, current-user lookup, and logout; Batch 7A adds authenticated workspace creation with an initial `OWNER` membership; Batch 7B adds membership-filtered workspace listing and retrieval; Batch 7C adds owner/admin workspace detail updates; Batch 7D adds owner-only transactional workspace deletion; Batch 7E adds database-enforced last-owner protection and documents the planned ownership-transfer design. Member management, invitations, role changes, ownership transfer, and broader RBAC remain unimplemented |
+| Phase 4: Authentication and Workspace Management | In progress | Batch 6D adds login, database-backed session validation, an authentication guard, current-user lookup, and logout; Batch 7A adds authenticated workspace creation with an initial `OWNER` membership; Batch 7B adds membership-filtered workspace listing and retrieval; Batch 7C adds owner/admin workspace detail updates; Batch 7D adds owner-only transactional workspace deletion; Batch 7E adds database-enforced last-owner protection and documents the planned ownership-transfer design; Batch 8B adds authenticated project creation with owner/admin authorization, validation, atomic project-plus-repository creation, and a GitHub repository resolver seam. Successful project creation is blocked until GitHub App repository verification is implemented. Batch 8C adds membership-authorized, workspace-scoped project listing with repository details, deterministic ordering, and offset pagination. Batch 8D adds membership-authorized, workspace-scoped individual project retrieval with explicit repository mapping. Batch 8E adds owner/admin, workspace-scoped project updates with partial name/description validation and repository preservation. Batch 8F adds owner/admin, workspace-scoped project deletion with transaction-scoped removal of project aggregate records, local repository deletion for the project, repository-scoped webhook cleanup, preservation of GitHub installation and unrelated workspace data, and 204 No Content responses. Batch 8G hardens project creation to require an `ACTIVE` installation, expands validation and inactive-installation test coverage, and adds PostgreSQL integration tests for existing project/repository workspace constraints. Member management, invitations, role changes, ownership transfer, and broader RBAC remain unimplemented |
 | Phase 5: GitHub Metadata Integration | Not started | GitHub App is the selected approach; not implemented |
 | Phase 6: Repository and Pull Request Metadata | Not started | Not implemented |
 | Phase 7: Background Worker and Sync Reliability | In progress | Independent worker scaffold added; BullMQ consumers and sync reliability not started |
@@ -984,12 +984,12 @@ Design decisions recorded:
   are derived server-side from the selected repository.
 - `OWNER` and `ADMIN` may manage projects. `MEMBER` and `VIEWER` have read-only
   project access. Non-members and cross-workspace projects return `404`.
-- Disconnecting a repository is separate from deleting a project. Deletion and
-  retention behavior requires approval.
-- Project deletion, if approved as permanent local deletion, should purge
-  project-owned webhook events, recommendations, risk assessments, pull requests,
-  issues, workflow runs, the repository, and the project in one transaction. It
-  must not delete the GitHub repository or uninstall the GitHub App.
+- Disconnecting a repository is separate from deleting a project.
+- Project deletion is implemented as a permanent local purge. It removes
+  repository-attributed webhook events, recommendations, risk assessments, pull
+  requests, issues, workflow runs, the project's exclusively owned repository
+  record, and the project in one transaction. It does not delete the GitHub
+  repository, uninstall the GitHub App, or remove unrelated workspace data.
 - `README.md`/API paths use the currently unprefixed `/workspaces` routes; project
   paths are proposed under the same convention.
 
@@ -1004,6 +1004,413 @@ Isolated PostgreSQL verification:
 
 Open approvals are listed in the Batch 8A final review. No verification claims
 are made for unimplemented project endpoints.
+
+### Batch 8B: Project creation endpoint
+
+Status: **Implemented with a repository-resolution dependency.** Adds
+`POST /workspaces/:workspaceId/projects` with unit and request-level E2E
+coverage. No Prisma schema or migration changes, GitHub App client, frontend
+work, or new dependencies were added.
+
+Implemented:
+
+- Authenticated `POST /workspaces/:workspaceId/projects`.
+- UUID validation for `workspaceId` and strict body validation for `name`,
+  nullable `description`, and canonical decimal-string `repositoryGithubId`.
+  Unknown fields are rejected.
+- Workspace membership authorization reusing existing workspace semantics:
+  missing/inaccessible workspaces return `404`, authenticated `MEMBER`/`VIEWER`
+  callers receive `403`, and only `OWNER`/`ADMIN` may create.
+- Global duplicate-repository checks with a `409` that does not reveal another
+  workspace, plus a re-check inside the transaction for races.
+- A `GITHUB_REPOSITORY_RESOLVER` seam. The default resolver returns a safe `503`
+  because GitHub App repository verification is not implemented yet. Successful
+  project creation is therefore not available until that integration exists.
+- Resolution metadata validation: archived repositories return `400`, and
+  installation IDs must belong to the path workspace.
+- Atomic project-plus-repository creation in one transaction with rollback on
+  failure. Unique failures map to `409`, foreign-key failures map to `404`, and
+  unexpected failures map to `500`.
+- Server-generated project slugs that are not exposed in API responses.
+- Safe response mapping that omits installation IDs, tokens, slugs, and session
+  data. GitHub IDs are serialized as strings.
+
+Files added:
+
+- `apps/api/src/projects/project.constants.ts`
+- `apps/api/src/projects/project.types.ts`
+- `apps/api/src/projects/project-slug.ts`
+- `apps/api/src/projects/repository-resolver.ts`
+- `apps/api/src/projects/dto/create-project.dto.ts`
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/src/projects/projects.controller.ts`
+- `apps/api/src/projects/projects.module.ts`
+- `apps/api/src/projects/project-slug.spec.ts`
+- `apps/api/src/projects/repository-resolver.spec.ts`
+- `apps/api/src/projects/projects.service.spec.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/app.module.ts` registers `ProjectsModule`.
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE_DESIGN.md`, and
+  `docs/PROGRESS.md` document the implemented behavior and remaining dependency.
+
+Verification executed on 2026-11-04:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 13 suites, 90 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 9 suites, 83 tests passed.
+- `pnpm --filter api build` passed.
+- Root `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` passed.
+
+Remaining limitations:
+
+- Successful project creation requires a future GitHub App repository resolver.
+- The GitHub installation workspace relationship is enforced in application code
+  for project creation but still lacks a database composite foreign key.
+- The schema still permits a repository-less project if written outside this
+  endpoint; the creation path does not create one.
+- Project retrieval, update, and deletion remained unimplemented at the close of
+  Batch 8B.
+
+### Batch 8C: Project listing endpoint
+
+Status: **Implemented.** Adds `GET /workspaces/:workspaceId/projects` with unit
+and request-level E2E coverage. No Prisma schema or migration changes, GitHub App
+changes, frontend work, or new dependencies were added.
+
+Implemented:
+
+- Authenticated `GET /workspaces/:workspaceId/projects`.
+- UUID validation for `workspaceId` and the established `page`/`limit` query
+  validation: minimum page 1, limit 1-100, default page 1 and limit 20.
+- Membership authorization before any project query. `OWNER`, `ADMIN`, `MEMBER`,
+  and `VIEWER` members may list. Nonexistent workspaces and non-members both
+  return `404 Workspace not found.` without querying project records.
+- Both the page query and total count are constrained by the path workspace, so
+  cross-workspace projects are never returned or counted.
+- Deterministic ordering by `createdAt` descending, then project ID descending.
+- Repository data selected with the project query instead of per-project
+  follow-up queries. Missing repository relations are mapped to `null`
+  defensively without hiding the project.
+- Explicit response mapping that omits slugs, installation IDs, tokens,
+  credentials, and session data. GitHub IDs are serialized as strings.
+- Unexpected database failures map to `500 Unable to list projects.`
+
+Files added:
+
+- `apps/api/src/projects/dto/list-projects-query.dto.ts`
+- `apps/api/src/projects/projects-list.service.spec.ts`
+
+Modified:
+
+- `apps/api/src/projects/project.constants.ts`
+- `apps/api/src/projects/project.types.ts`
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/src/projects/projects.controller.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, and `docs/PROGRESS.md`
+
+Verification executed on 2026-11-04:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 14 suites, 97 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 9 suites, 100 tests passed.
+- `pnpm --filter api build` passed.
+- Root `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` passed.
+
+Remaining limitations:
+
+- Successful project creation still requires the future GitHub App repository
+  resolver.
+- Project update and deletion remained unimplemented at the close of Batch 8C.
+- The schema still permits a repository-less project if written outside the
+  creation endpoint; listing and retrieval represent such a project with
+  `repository: null`.
+
+### Batch 8D: Individual project retrieval endpoint
+
+Status: **Implemented.** Adds `GET /workspaces/:workspaceId/projects/:projectId`
+with unit and request-level E2E coverage. No Prisma schema or migration changes,
+GitHub App changes, frontend work, or new dependencies were added.
+
+Implemented:
+
+- Authenticated `GET /workspaces/:workspaceId/projects/:projectId`.
+- UUID validation for both `workspaceId` and `projectId`.
+- Membership authorization before any project lookup. `OWNER`, `ADMIN`, `MEMBER`,
+  and `VIEWER` members may retrieve. Nonexistent workspaces and non-members both
+  return `404 Workspace not found.` without querying project records.
+- The project lookup is scoped by both the path `workspaceId` and `projectId`. A
+  missing project and a project belonging to another workspace both return
+  `404 Project not found.`
+- Repository data is selected with the project lookup, avoiding a follow-up query.
+  A missing repository relation is mapped to `null` defensively.
+- Explicit response mapping shared with project listing, omitting slugs,
+  installation IDs, tokens, credentials, and session data. GitHub IDs are
+  serialized as strings.
+- Unexpected database failures map to `500 Unable to retrieve project.`
+
+Files added:
+
+- `apps/api/src/projects/projects-retrieval.service.spec.ts`
+
+Modified:
+
+- `apps/api/src/projects/project.constants.ts`
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/src/projects/projects.controller.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, and `docs/PROGRESS.md`
+
+Verification executed on 2026-11-04:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 15 suites, 103 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 9 suites, 113 tests passed.
+- `pnpm --filter api build` passed.
+- Root `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` passed.
+
+Remaining limitations:
+
+- Successful project creation still requires the future GitHub App repository
+  resolver.
+- Project update and deletion remained unimplemented at the close of Batch 8D.
+- The schema still permits a repository-less project if written outside the
+  creation endpoint; listing and retrieval represent such a project with
+  `repository: null`.
+
+### Batch 8E: Project update endpoint
+
+Status: **Implemented.** Adds
+`PATCH /workspaces/:workspaceId/projects/:projectId` with unit and request-level
+E2E coverage. No Prisma schema or migration changes, GitHub App changes,
+frontend work, or new dependencies were added.
+
+Implemented:
+
+- Authenticated `PATCH /workspaces/:workspaceId/projects/:projectId`.
+- UUID validation for both `workspaceId` and `projectId`.
+- Partial update validation requiring at least one of `name` or `description`.
+  Empty bodies return `400 At least one of name or description must be provided.`
+- `name` is trimmed, non-empty, and limited to 255 characters. `description` is
+  trimmed, limited to 2000 characters, and may be `null` to clear it. Omitted
+  fields are preserved.
+- Unknown, immutable, and repository-assignment fields are rejected, including
+  `repositoryGithubId`, `repositoryId`, `workspaceId`, `projectId`, `slug`,
+  status, role, and timestamps.
+- Membership authorization and the update run in one transaction. Nonexistent
+  workspaces and non-members return `404 Workspace not found.` without changing
+  data. `MEMBER` and `VIEWER` members receive `403`; only `OWNER` and `ADMIN` may
+  update.
+- The update is scoped by both the path `workspaceId` and `projectId` through the
+  project compound unique key. A missing project and a project belonging to
+  another workspace both return `404 Project not found.`
+- Repository relationships are preserved. Repository data is selected with the
+  updated project, avoiding a follow-up query.
+- Explicit response mapping shared with project listing and retrieval omits slugs,
+  installation IDs, tokens, credentials, and session data. GitHub IDs are
+  serialized as strings.
+- Prisma `P2025` failures map to `404 Project not found.` and unexpected database
+  failures map to `500 Unable to update project.`
+
+Files added:
+
+- `apps/api/src/projects/dto/update-project.dto.ts`
+- `apps/api/src/projects/projects-update.service.spec.ts`
+
+Modified:
+
+- `apps/api/src/projects/project.constants.ts`
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/src/projects/projects.controller.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, and `docs/PROGRESS.md`
+
+Verification executed on 2026-11-04:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 16 suites, 115 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 9 suites, 138 tests passed.
+- `pnpm --filter api build` passed.
+- Root `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` passed.
+
+Remaining limitations:
+
+- Successful project creation still requires the future GitHub App repository
+  resolver.
+- Project deletion was unimplemented at the close of Batch 8E; Batch 8F
+  implements it.
+- The schema still permits a repository-less project if written outside the
+  creation endpoint; listing, retrieval, and updates represent such a project
+  with `repository: null`.
+
+### Batch 8F: Project deletion endpoint
+
+Status: **Implemented.** Adds
+`DELETE /workspaces/:workspaceId/projects/:projectId` with unit and request-level
+E2E coverage. No Prisma schema or migration changes, GitHub App changes,
+frontend work, or new dependencies were added.
+
+Implemented:
+
+- Authenticated `DELETE /workspaces/:workspaceId/projects/:projectId`.
+- UUID validation for both `workspaceId` and `projectId`.
+- Membership and role authorization. Nonexistent workspaces and non-members
+  return `404 Workspace not found.` `MEMBER` and `VIEWER` members receive `403
+  You do not have permission to delete this project.` `OWNER` and `ADMIN` may
+  delete.
+- Deletion is scoped by both the path `workspaceId` and `projectId`. A missing
+  project and a project belonging to another workspace both return `404 Project
+  not found.` Repeated deletion returns the same `404`.
+- One transaction resolves the project, removes webhook events linked only to the
+  project's repository, removes recommendations and risk assessments scoped by
+  project and workspace, removes pull requests, issues, and workflow runs scoped
+  by repository and workspace, deletes the project's repository record scoped by
+  repository/project/workspace, and deletes the project by its compound unique
+  key.
+- Webhook events that cannot be attributed to the project's repository, including
+  workspace-level and other-project events, are preserved.
+- The workspace, GitHub installation and credentials, users, sessions,
+  memberships, other projects, unrelated repositories, and external GitHub data
+  are preserved. The endpoint does not uninstall the GitHub App.
+- The project's exclusively owned local repository record is permanently deleted,
+  releasing its global GitHub identifier for a future connection.
+- Legacy/pre-invariant projects without a repository record still delete their
+  project-scoped records and the project; repository-linked records cannot be
+  identified and are preserved.
+- Success returns `204 No Content` with an empty body. Prisma `P2025` maps to `404
+  Project not found.`; unexpected failures map to `500 Unable to delete project.`
+
+Files added:
+
+- `apps/api/src/projects/projects-delete.service.spec.ts`
+- `apps/api/test/projects-delete.e2e-spec.ts`
+
+Modified:
+
+- `apps/api/src/projects/project.constants.ts`
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE_DESIGN.md`, and
+  `docs/PROGRESS.md`
+
+Verification executed on 2026-11-05:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 17 suites, 124 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 10 suites, 151 tests passed.
+- `pnpm --filter api build` passed.
+
+Remaining limitations:
+
+- Successful project creation still requires the future GitHub App repository
+  resolver.
+- Repository disconnection and reconnection endpoints remain unimplemented.
+- The schema still permits a repository-less project if written outside the
+  creation endpoint; deletion preserves repository-linked records it cannot
+  attribute in that legacy case.
+
+### Batch 8G: Project management hardening review
+
+Status: **Implemented.** A focused security and data-integrity review of the
+Phase 8 project-management endpoints. Authorization, workspace isolation,
+validation, error mapping, sensitive-data exposure, repository association, and
+deletion behavior were reviewed. No schema or migration changes, endpoint,
+role, frontend, worker, GitHub App, or dependency changes were made.
+
+Hardened:
+
+- Project creation now requires the resolved repository installation to have
+  `ACTIVE` status in addition to belonging to the path workspace. Suspended and
+  disconnected installations are rejected with
+  `404 Repository not found.` before the project/repository transaction writes.
+- Project update request validation coverage now explicitly rejects
+  `projectId`, `userId`, `role`, `status`, `createdAt`, and `updatedAt` in
+  addition to repository, workspace, and slug fields.
+- Project creation request validation coverage now explicitly rejects
+  `repositoryId`.
+- PostgreSQL integration coverage now exercises the existing
+  `(projectId, workspaceId)` repository foreign key, one-repository-per-project
+  uniqueness, global GitHub repository ID uniqueness, and restrictive
+  project/workspace deletion constraints.
+
+Verified review outcomes:
+
+- Project creation, update, and deletion authorize `OWNER` and `ADMIN` members
+  and reject `MEMBER`/`VIEWER` with `403`, consistent with the approved Phase 8A
+  matrix. Non-members and nonexistent workspaces return `404`.
+- The Phase 8G request included a proposed role table that forbade `ADMIN`
+  deletion, which conflicts with the approved Phase 8A project-management matrix.
+  The approved matrix was preserved, so `ADMIN` deletion remains allowed.
+- Project listing, retrieval, updates, and deletion scope queries by the path
+  workspace. Cross-workspace project access returns `404`; no project data from
+  another workspace is returned.
+- Repository resolution is server-side. Client repository metadata and
+  identifiers outside the documented creation contract are rejected.
+- API responses do not expose installation IDs, GitHub credentials or tokens,
+  sessions, internal slugs, or raw database errors.
+- Project deletion removes only the selected project aggregate and
+  repository-attributed webhook events. It preserves other projects,
+  repositories, installations, memberships, sessions, and users.
+
+Known integrity gaps retained for a future approved migration:
+
+- `Repository.installationId` does not have a composite foreign key to
+  `GitHubInstallation(id, workspaceId)`, so direct database writes can still
+  attach a repository to another workspace's installation. Application creation
+  rejects this case.
+- The database does not require every project to have exactly one repository;
+  legacy/directly written repo-less projects remain possible.
+- `Recommendation.riskAssessmentId` does not enforce that the referenced risk
+  assessment belongs to the same project and workspace.
+- Optional webhook installation/repository/workspace consistency remains an
+  application-level requirement.
+
+Files added:
+
+- `packages/database/test/project-integrity.test.mjs`
+
+Modified:
+
+- `apps/api/src/projects/projects.service.ts`
+- `apps/api/src/projects/projects.service.spec.ts`
+- `apps/api/test/projects.e2e-spec.ts`
+- `packages/database/package.json`
+- `docs/API_CONTRACT.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE_DESIGN.md`, and
+  `docs/PROGRESS.md`
+
+Verification executed on 2026-11-05:
+
+- `pnpm --filter api typecheck` passed.
+- `pnpm --filter api lint` passed.
+- `pnpm --filter api test --runInBand`: 17 suites, 124 tests passed.
+- `pnpm --filter api test:e2e --runInBand`: 10 suites, 159 tests passed.
+- `pnpm --filter api build` passed.
+- `pnpm --filter @devpulse/database db:validate` passed.
+- Root `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm build` passed.
+- Direct `node --test packages/database/test/project-integrity.test.mjs` with
+  the local `DATABASE_URL`: 4 tests passed.
+- The combined database integration command was executed and did not pass: 5 of
+  10 tests passed. The 4 new project-integrity tests passed;
+  `workspace-ownership.test.mjs` failed 5 of its 6 tests because
+  `20261104100000_enforce_workspace_owner_invariants` is not applied to the
+  local development database. The migration was not applied during this batch.
+
+Remaining limitations:
+
+- The database integrity defects above require a reviewed Prisma migration and a
+  migrated disposable or development database before they can be closed and
+  verified.
+- Successful project creation still requires the future GitHub App repository
+  resolver; the default resolver returns `503`.
+- Repository disconnection and reconnection endpoints remain unimplemented.
 
 ## Implemented repository state
 
@@ -1060,6 +1467,7 @@ DevPulse/
 │       │   ├── client.ts
 │       │   └── index.ts
 │       ├── test/
+│       │   ├── project-integrity.test.mjs
 │       │   └── workspace-ownership.test.mjs
 │       ├── package.json
 │       ├── prisma.config.ts
@@ -1107,6 +1515,12 @@ Resolved decisions:
   documented in `DATABASE_DESIGN.md`.
 - Workspace listing uses validated offset pagination because per-user workspace
   sets are expected to be small.
+- Project management is restricted to `OWNER` and `ADMIN` members. Project
+  deletion permanently purges the project aggregate and its exclusively owned
+  local repository record transactionally, preserves the workspace, GitHub
+  installation, users, sessions, memberships, other projects, unrelated
+  repositories, and unattributable webhook events, and does not call GitHub to
+  delete a repository or uninstall the App.
 - GitHub integration uses a GitHub App.
 
 The following decisions remain open and must be resolved before the dependent
@@ -1124,22 +1538,33 @@ phase begins:
 - Recommendation category taxonomy
 - Ownership-transfer endpoint behavior, audit trail, and authorization flow
 - Whether raw webhook payloads are ever retained
-- Enforcement of project-to-repository connectivity
+- Database-level enforcement of project-to-repository connectivity
 
 See the open-decision sections in the architecture, database, API, and roadmap
 documents for details.
 
 ## Next step
 
-Await developer approval of the Batch 8A project architecture review and its
-open decisions. No project-management endpoints were implemented. The existing
-workspace creation, listing, retrieval, updates, deletion, and database last-owner
+Await developer approval of the GitHub App repository-resolution design needed to
+make project creation succeed. The project creation endpoint, authorization,
+validation, transaction, and rollback behavior are implemented and verified with
+a stubbed resolver; the default resolver currently returns `503`. Project listing,
+authorization, workspace isolation, ordering, pagination, and repository mapping
+are implemented and verified. Individual project retrieval, authorization,
+workspace-scoped lookup, and repository mapping are implemented and verified.
+Project updates, partial validation, workspace-scoped authorization, and
+repository preservation are implemented and verified. Project deletion,
+owner/admin authorization, workspace-scoped lookup, transaction-based aggregate
+removal, local repository lifecycle handling for the deleted project, and
+preservation of the GitHub installation and unrelated workspace data are
+implemented and verified. The existing workspace
+creation, listing, retrieval, updates, deletion, and database last-owner
 invariant remain implemented and verified. The Docker Compose development database
 remains unmigrated and unverified because Docker access is unavailable.
 
 Known outstanding work includes CSRF protection for cookie-authenticated
 state-changing requests, session cleanup for expired/revoked records, workspace
 invitations, member management, role changes, ownership transfer endpoints,
-broader RBAC, password reset, email verification, GitHub sign-in, project
-repository-selection and lifecycle flows, and external GitHub App uninstallation
-or cleanup for deleted workspaces.
+broader RBAC, password reset, email verification, GitHub sign-in, the GitHub App
+repository resolver, repository disconnection/reconnection, and external GitHub
+App uninstallation or cleanup for deleted workspaces.

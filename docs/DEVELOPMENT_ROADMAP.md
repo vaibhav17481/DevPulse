@@ -2,10 +2,20 @@
 
 ## Document status
 
-The project uses a 12-phase development structure. Phase 1 is in progress; every
-later phase is not started. Phase titles and scope below are working descriptions
-for planning. They are not final feature requirements and require detailed
-approval before implementation.
+The project uses a 12-phase development structure. Implementation has started
+ahead of the original phase order: the Phase 1 foundation is complete; Phase 2
+local infrastructure and database foundation is in progress; Phase 4
+authentication and workspace management is in progress; Phase 7 has an
+independent worker scaffold; and Phase 10 has a Next.js scaffold. Phases 3, 5, 6,
+8, 9, 11, and 12 are not started. The current implementation state is tracked in
+`docs/PROGRESS.md`.
+
+Phase titles and scope below are working descriptions for planning. They are not
+final feature requirements and require detailed approval before implementation.
+
+The "Batch 8A" through "Batch 8G" entries in `docs/PROGRESS.md` are
+project-management batches within Phase 4, not the roadmap's Phase 8
+(Deployment and CI Metadata). Keep those numbering schemes distinct.
 
 The roadmap intentionally favors small, tested milestones. A phase is not
 complete until its implementation, tests, documentation, and verification are
@@ -117,6 +127,12 @@ Documentation:
 - Authentication flow.
 - Role and permission matrix.
 - Workspace lifecycle rules.
+
+Implementation note: the Phase 4 batch series currently includes workspace-scoped
+project management (Batches 8A-8G in `docs/PROGRESS.md`) even though projects are
+not named in this phase goal. Project management remains limited to minimal
+workspace containers for one GitHub repository as documented in
+`docs/ARCHITECTURE.md`.
 
 ## Phase 5: GitHub Metadata Integration
 

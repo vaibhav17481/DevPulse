@@ -6,17 +6,29 @@ Most paths, payloads, and status codes in this document remain **proposed** and
 must be approved before implementation. The email/password endpoints and initial
 workspace endpoints described under "Implemented endpoints" are implemented:
 registration, login, current user, logout, workspace creation, workspace
-listing, workspace retrieval, workspace detail updates, and workspace deletion.
+listing, workspace retrieval, workspace detail updates, workspace deletion,
+project creation, project listing, individual project retrieval, project
+updates, and project deletion.
 Authentication uses database-backed sessions and an HTTP-only session cookie.
 Workspace creation assigns the creator an `OWNER` membership, and workspace
-listing, retrieval, and updates require an active membership. Workspace updates
-are limited to `OWNER` and `ADMIN` members. Workspace deletion is limited to
-`OWNER` members. The database enforces that a workspace cannot commit without an
-`OWNER` and that the last `OWNER` cannot be deleted or demoted. Invitations,
-member management, role changes, ownership transfer, broader workspace
-authorization, GitHub sign-in, and the rest of the API remain proposed and are
-not implemented. The project endpoints and project-management authorization rules
-in this document are Phase 8A proposals and are not implemented.
+listing, retrieval, and updates require an active membership. Workspace
+updates are limited to `OWNER` and `ADMIN` members. Workspace deletion is limited
+to `OWNER` members. The database enforces that a workspace cannot commit without an
+`OWNER` and that the last `OWNER` cannot be deleted or demoted.
+
+Project creation implements the Phase 8A authorization, validation, atomic
+project-plus-repository write, and safe response rules. Repository selection is
+delegated to a server-side GitHub repository resolver. GitHub App repository
+verification and discovery are not implemented yet, so the current resolver
+returns `503 Service Unavailable`; a project without a repository is still not
+created. Batch 8G hardening requires the resolved installation to belong to the
+path workspace and be `ACTIVE`. Project listing supports workspace-scoped
+pagination and project retrieval supports workspace-scoped detail lookup for all
+workspace members. Project deletion permanently removes the project aggregate for
+`OWNER` and `ADMIN` members without deleting the GitHub installation or unrelated
+workspace data. Invitations, member management, role changes, ownership transfer,
+broader workspace authorization, GitHub sign-in, and the rest of the API remain
+proposed and are not implemented.
 
 ## API conventions
 
@@ -388,6 +400,278 @@ Behavior:
   installation cleanup remains a separate operational task.
 - Successful deletion returns `204 No Content` with no response body.
 
+### `POST /workspaces/:workspaceId/projects`
+
+Requires a valid `devpulse_session` cookie. Creates one project and its connected
+repository in one database transaction when the authenticated user is an `OWNER`
+or `ADMIN` member of the workspace.
+
+Request body:
+
+```json
+{
+  "name": "Checkout API",
+  "description": "Optional description",
+  "repositoryGithubId": "123456789"
+}
+```
+
+Validation and behavior:
+
+- `workspaceId` must be a valid UUID.
+- `name` is required, trimmed, non-empty, and limited to 255 characters.
+- `description` is optional and nullable, trimmed when supplied, and limited to
+  2000 characters.
+- `repositoryGithubId` is required and must be a canonical positive decimal
+  string of at most 19 digits. Leading zeroes, zero, negative values, and values
+  outside the PostgreSQL `bigint` range are rejected.
+- Unknown request fields are rejected, including `workspaceId`, `projectId`,
+  `userId`, `role`, `slug`, status, timestamps, and repository metadata. The
+  creator and membership role come only from the authenticated session.
+- The caller's membership is checked before repository resolution and checked
+  again inside the creation transaction.
+- `OWNER` and `ADMIN` members may create projects. `MEMBER` and `VIEWER` members
+  receive `403 You do not have permission to create projects in this workspace.`
+- A nonexistent workspace and a workspace the user cannot access both return the
+  same `404 Workspace not found.` response.
+- `repositoryGithubId` is globally unique across connected repositories. A
+  repository already connected to any project or workspace returns `409
+  Repository is already connected to a project.` without revealing the other
+  workspace.
+- Repository metadata is not accepted from the client. The server resolves the
+  repository through the workspace's active GitHub installation and derives the
+  owner login, repository name, full name, default branch, visibility, and
+  archived state. A resolved installation must belong to the path workspace and
+  have `ACTIVE` status; suspended or disconnected installations are rejected.
+- Archived repositories are rejected with `400`. A repository that cannot be
+  resolved, an installation that does not belong to the workspace, or an
+  installation that is not active returns `404 Repository not found.`
+- The project and repository are created atomically. If either write fails, the
+  transaction is rolled back and no project is left without a repository.
+- Unique-constraint races are returned as `409`; foreign-key failures are returned
+  as `404`; other unexpected failures return `500 Unable to create project.`
+- **Current dependency:** GitHub App repository verification is not implemented.
+  The repository resolver currently returns `503 GitHub repository verification is
+  not available.` Successful project creation requires the future GitHub
+  integration to implement that resolver. No repo-less fallback and no
+  client-supplied repository metadata are accepted.
+
+Success response (`201 Created`):
+
+```json
+{
+  "id": "8f0a7c2e-1f9b-4d10-9a2b-3c4d5e6f7081",
+  "workspaceId": "3f6f2a5e-4a7d-4f5d-8f0a-7c2e1f9b6d10",
+  "name": "Checkout API",
+  "description": "Optional description",
+  "repository": {
+    "id": "6d10a7c2-e1f9-4b4d-8a2b-3c4d5e6f7081",
+    "githubId": "123456789",
+    "ownerLogin": "acme",
+    "name": "checkout-api",
+    "fullName": "acme/checkout-api",
+    "defaultBranch": "main",
+    "visibility": "PRIVATE",
+    "isArchived": false,
+    "connectionStatus": "ACTIVE",
+    "connectedAt": "2026-11-04T10:00:00.000Z",
+    "disconnectedAt": null,
+    "lastSyncedAt": null
+  },
+  "createdAt": "2026-11-04T10:00:00.000Z",
+  "updatedAt": "2026-11-04T10:00:00.000Z"
+}
+```
+
+The response does not expose the internal `slug`, installation ID, GitHub
+installation permissions, tokens, credentials, or session data.
+
+Error responses for project creation:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Missing, malformed, or unknown request fields, invalid workspace UUID, invalid repository GitHub ID, or an archived repository |
+| `401` | Missing or invalid authentication |
+| `403` | The authenticated member lacks `OWNER` or `ADMIN` |
+| `404` | Workspace does not exist or is not accessible, repository cannot be resolved, repository installation does not belong to the workspace, or repository installation is not active |
+| `409` | Repository is already connected or a unique constraint race occurs |
+| `500` | Unexpected server failure or a rolled-back project/repository creation |
+| `503` | GitHub repository verification is not available |
+
+### `GET /workspaces/:workspaceId/projects`
+
+Requires a valid `devpulse_session` cookie. Lists projects that belong to the
+workspace in the path when the authenticated user has any active membership in
+that workspace.
+
+Validation and behavior:
+
+- `workspaceId` must be a valid UUID.
+- The caller's membership is checked before any project query. A nonexistent
+  workspace and a workspace the caller cannot access both return `404 Workspace
+  not found.` and no project data.
+- `OWNER`, `ADMIN`, `MEMBER`, and `VIEWER` members may list projects.
+- Both the project query and the total count are constrained by the path
+  `workspaceId`. Projects from other workspaces are never returned.
+- Results are ordered deterministically by `createdAt` descending, then project
+  ID descending.
+- Pagination uses the workspace-list convention: optional `page` (minimum 1,
+  default 1) and `limit` (1–100, default 20). Invalid, non-integer, or
+  out-of-range values return `400`.
+- The repository relation is selected in the same project query, avoiding an
+  N+1 query. A repository that is missing in legacy or pre-invariant data is
+  represented as `null`; the normal project-creation path always creates one.
+- Responses do not expose internal slugs, installation IDs, GitHub
+  installation permissions, tokens, credentials, or session data.
+
+Success response (`200 OK`):
+
+```json
+{
+  "items": [
+    {
+      "id": "8f0a7c2e-1f9b-4d10-9a2b-3c4d5e6f7081",
+      "workspaceId": "3f6f2a5e-4a7d-4f5d-8f0a-7c2e1f9b6d10",
+      "name": "Checkout API",
+      "description": "Optional description",
+      "repository": {
+        "id": "6d10a7c2-e1f9-4b4d-8a2b-3c4d5e6f7081",
+        "githubId": "123456789",
+        "ownerLogin": "acme",
+        "name": "checkout-api",
+        "fullName": "acme/checkout-api",
+        "defaultBranch": "main",
+        "visibility": "PRIVATE",
+        "isArchived": false,
+        "connectionStatus": "ACTIVE",
+        "connectedAt": "2026-11-04T10:00:00.000Z",
+        "disconnectedAt": null,
+        "lastSyncedAt": null
+      },
+      "createdAt": "2026-11-04T10:00:00.000Z",
+      "updatedAt": "2026-11-04T10:00:00.000Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total": 1,
+    "totalPages": 1
+  }
+}
+```
+
+Error responses for project listing:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid workspace UUID or invalid `page`/`limit` |
+| `401` | Missing or invalid authentication |
+| `404` | Workspace does not exist or is not accessible to the current user |
+| `500` | Unexpected server failure |
+
+### `GET /workspaces/:workspaceId/projects/:projectId`
+
+Requires a valid `devpulse_session` cookie. Retrieves one project that belongs to
+the workspace in the path when the authenticated user has any active membership
+in that workspace.
+
+Validation and behavior:
+
+- `workspaceId` and `projectId` must both be valid UUIDs.
+- The caller's membership is checked before any project lookup. A nonexistent
+  workspace and a workspace the caller cannot access both return `404 Workspace
+  not found.` and no project data.
+- `OWNER`, `ADMIN`, `MEMBER`, and `VIEWER` members may retrieve projects.
+- The lookup is scoped by both `projectId` and the path `workspaceId`. A project
+  that does not exist in that workspace, including one that belongs to another
+  workspace, returns `404 Project not found.` The API does not reveal whether the
+  project exists elsewhere.
+- The repository relation is selected in the same project lookup, avoiding a
+  follow-up query. A repository that is missing in legacy or pre-invariant data is
+  represented as `null`.
+- Responses use the same explicitly mapped shape as project listing items and do
+  not expose internal slugs, installation IDs, GitHub installation permissions,
+  tokens, credentials, or session data.
+
+Success response (`200 OK`):
+
+```json
+{
+  "id": "8f0a7c2e-1f9b-4d10-9a2b-3c4d5e6f7081",
+  "workspaceId": "3f6f2a5e-4a7d-4f5d-8f0a-7c2e1f9b6d10",
+  "name": "Checkout API",
+  "description": "Optional description",
+  "repository": {
+    "id": "6d10a7c2-e1f9-4b4d-8a2b-3c4d5e6f7081",
+    "githubId": "123456789",
+    "ownerLogin": "acme",
+    "name": "checkout-api",
+    "fullName": "acme/checkout-api",
+    "defaultBranch": "main",
+    "visibility": "PRIVATE",
+    "isArchived": false,
+    "connectionStatus": "ACTIVE",
+    "connectedAt": "2026-11-04T10:00:00.000Z",
+    "disconnectedAt": null,
+    "lastSyncedAt": null
+  },
+  "createdAt": "2026-11-04T10:00:00.000Z",
+  "updatedAt": "2026-11-04T10:00:00.000Z"
+}
+```
+
+Error responses for project retrieval:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid workspace UUID or project UUID |
+| `401` | Missing or invalid authentication |
+| `404` | Workspace does not exist or is not accessible, or the project is absent from the path workspace |
+| `500` | Unexpected server failure |
+
+### `PATCH /workspaces/:workspaceId/projects/:projectId`
+
+Requires a valid `devpulse_session` cookie. Updates the name, description, or both
+for a project in the path workspace. Only `OWNER` and `ADMIN` members may update;
+`MEMBER` and `VIEWER` members receive `403`.
+
+Validation and behavior:
+
+- `workspaceId` and `projectId` must both be valid UUIDs.
+- The request must contain at least one of `name` or `description`. An empty body
+  returns `400 At least one of name or description must be provided.`
+- `name` is trimmed, must be non-empty, and is limited to 255 characters.
+- `description` is trimmed, limited to 2000 characters, and may be `null` to clear
+  it. Omitted fields are preserved.
+- Unknown or immutable fields, including `repositoryGithubId`, `repositoryId`,
+  `workspaceId`, `projectId`, `slug`, status, role, and timestamps, are rejected
+  by request validation.
+- Membership and the update occur in one transaction. A nonexistent workspace or
+  a workspace the caller cannot access returns `404 Workspace not found.` without
+  changing project data. An authenticated member without permission receives
+  `403`.
+- The update is scoped by both `projectId` and the path `workspaceId`. A project
+  that is absent from that workspace, including one that belongs to another
+  workspace, returns `404 Project not found.`
+- The repository association is not changed. The repository relation is selected
+  with the updated project and returned using the same explicitly mapped shape as
+  project retrieval.
+- Unexpected database failures map to `500 Unable to update project.`
+
+Success response (`200 OK`): the same project response shape as
+`GET /workspaces/:workspaceId/projects/:projectId`.
+
+Error responses for project updates:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid UUID, empty body, unknown or immutable field, or invalid field value |
+| `401` | Missing or invalid authentication |
+| `403` | The authenticated member lacks permission to update projects |
+| `404` | Workspace does not exist or is not accessible, or the project is absent from the path workspace |
+| `500` | Unexpected server failure |
+
 Error responses for workspace endpoints:
 
 | Status | Meaning |
@@ -567,11 +851,11 @@ is adopted for the public API, these paths move under that prefix.
 
 | Method | Path | Purpose | Status |
 | --- | --- | --- | --- |
-| `POST` | `/workspaces/:workspaceId/projects` | Create a project and connect one GitHub repository | Proposed |
-| `GET` | `/workspaces/:workspaceId/projects` | List projects in a workspace | Proposed |
-| `GET` | `/workspaces/:workspaceId/projects/:projectId` | Read one project | Proposed |
-| `PATCH` | `/workspaces/:workspaceId/projects/:projectId` | Update project name or description | Proposed |
-| `DELETE` | `/workspaces/:workspaceId/projects/:projectId` | Permanently delete a project aggregate | Proposed |
+| `POST` | `/workspaces/:workspaceId/projects` | Create a project and connect one GitHub repository | Implemented; repository resolution requires GitHub App integration |
+| `GET` | `/workspaces/:workspaceId/projects` | List projects in a workspace | Implemented |
+| `GET` | `/workspaces/:workspaceId/projects/:projectId` | Read one project | Implemented |
+| `PATCH` | `/workspaces/:workspaceId/projects/:projectId` | Update project name or description | Implemented |
+| `DELETE` | `/workspaces/:workspaceId/projects/:projectId` | Permanently delete a project aggregate | Implemented |
 
 All project endpoints require a valid `devpulse_session` cookie. Every request
 checks the caller's membership in the workspace identified by the path. The path
@@ -593,6 +877,7 @@ operations.
 ```json
 {
   "id": "uuid",
+  "workspaceId": "uuid",
   "name": "Checkout API",
   "description": "Optional description",
   "repository": {
@@ -623,115 +908,89 @@ repository. A disconnected repository remains present with
 
 #### `POST /workspaces/:workspaceId/projects`
 
-Authorization: `OWNER` or `ADMIN`. `MEMBER` and `VIEWER` receive `403`.
+This endpoint is implemented. Its actual request, authorization, repository
+association, response, and error behavior are documented under
+`POST /workspaces/:workspaceId/projects` in "Implemented endpoints".
 
-Proposed request:
-
-```json
-{
-  "name": "Checkout API",
-  "description": "Optional description",
-  "repositoryGithubId": "123456789"
-}
-```
-
-Rules:
-
-- `name` is required, trimmed, and between 1 and 255 characters.
-- `description` is optional, trimmed, at most 2000 characters, and `null` clears
-  it.
-- `repositoryGithubId` is required and is a decimal string. It must identify a
-  repository visible to the workspace's active GitHub installation. The server
-  verifies the repository through GitHub and derives owner login, name, full name,
-  visibility, default branch, and archived state. The client must not submit those
-  fields.
-- The project and repository are created in one transaction using the workspace
-  from the path. The body must not contain `workspaceId`, `projectId`, `userId`,
-  `role`, `slug`, status, timestamps, or repository metadata.
-- New connections to an archived repository are rejected.
-- The GitHub repository must not already be connected to any DevPulse project or
-  workspace. The response must not reveal the identity of another workspace where
-  the repository is connected.
-
-Responses:
-
-- `201 Created` with the project response.
-- `400 Bad Request` for malformed UUIDs, fields, or validation failures.
-- `401 Unauthorized` for missing or invalid authentication.
-- `403 Forbidden` when the member lacks `OWNER` or `ADMIN`.
-- `404 Not Found` for an inaccessible workspace or a repository that cannot be
-  resolved through the workspace installation.
-- `409 Conflict` when the repository is already connected or cannot be uniquely
-  selected.
-- `503 Service Unavailable` when GitHub cannot be queried safely.
+Repository selection uses `repositoryGithubId` and requires server-side
+verification through the workspace's active GitHub installation. That GitHub App
+resolver is not implemented yet and currently returns `503`. No repo-less project
+is created in the meantime.
 
 #### `GET /workspaces/:workspaceId/projects`
 
-Authorization: any workspace member.
-
-Query parameters: optional `page` (minimum 1, default 1) and `limit` (1-100,
-default 20). Results are ordered predictably, preferably by `createdAt` descending
-then project ID descending. The count and item query must both be constrained to
-the path workspace.
-
-Response: `200 OK` with `{ "items": ProjectResponse[], "pagination": { "page",
-"limit", "total", "totalPages" } }`.
-
-Errors: `400` for invalid query values, `401`, `404` for an inaccessible
-workspace, and `500` for unexpected failures.
+This endpoint is implemented. Its actual authorization, pagination, ordering,
+response, and error behavior are documented under
+`GET /workspaces/:workspaceId/projects` in "Implemented endpoints".
 
 #### `GET /workspaces/:workspaceId/projects/:projectId`
 
-Authorization: any workspace member.
-
-The lookup must use both `projectId` and `workspaceId`. A project that exists in a
-different workspace is indistinguishable from a missing project: `404`.
-
-Response: `200 OK` with the project response. Errors: `400` for malformed UUIDs,
-`401`, `404`, and `500`.
+This endpoint is implemented. Its actual authorization, workspace-scoped lookup,
+response, and error behavior are documented under
+`GET /workspaces/:workspaceId/projects/:projectId` in "Implemented endpoints".
 
 #### `PATCH /workspaces/:workspaceId/projects/:projectId`
 
-Authorization: `OWNER` or `ADMIN`. `MEMBER` and `VIEWER` receive `403`.
-
-Proposed request accepts at least one of:
-
-```json
-{
-  "name": "Updated project name",
-  "description": "Updated description or null"
-}
-```
-
-Validation matches project creation. Repository fields, repository reassignment,
-`workspaceId`, `projectId`, `slug`, status, role, and timestamps are rejected as
-unknown or immutable fields. The membership check and update occur in one
-transaction, and the update is scoped by both project ID and workspace ID.
-
-Response: `200 OK` with the updated project response. Errors: `400` for an empty
-body or validation failure, `401`, `403`, `404`, and `500`.
+This endpoint is implemented. Its actual authorization, validation,
+workspace-scoped update, repository preservation, response, and error behavior
+are documented under `PATCH /workspaces/:workspaceId/projects/:projectId` in
+"Implemented endpoints".
 
 #### `DELETE /workspaces/:workspaceId/projects/:projectId`
 
-Authorization: `OWNER` or `ADMIN`. `MEMBER` and `VIEWER` receive `403`.
+Requires a valid `devpulse_session` cookie. Permanently deletes a project that
+belongs to the workspace in the path.
 
-This permanently deletes the local DevPulse project aggregate. It does not delete
-or modify the GitHub repository, and it does not uninstall the workspace's GitHub
-App installation. It is distinct from repository disconnection, which retains the
-project and historical metadata.
+Validation and behavior:
 
-If permanent deletion is approved, one transaction deletes webhook events linked
-to the project's repository, recommendations, risk assessments, pull requests,
-issues, workflow runs, the repository record, and the project record, in that
-order. Every step is scoped to the project and workspace. Other projects,
-workspace memberships, the GitHub installation, and external GitHub data are
-preserved.
+- `workspaceId` and `projectId` must both be valid UUIDs.
+- The caller's membership is checked before any deletion. A nonexistent
+  workspace and a workspace the caller cannot access both return `404 Workspace
+  not found.` and no data is deleted.
+- `OWNER` and `ADMIN` members may delete projects, following the Phase 8A
+  project-management matrix. `MEMBER` and `VIEWER` members receive `403 You do
+  not have permission to delete this project.`
+- The deletion is scoped by both `projectId` and the path `workspaceId`. A project
+  that does not exist in that workspace, including one that belongs to another
+  workspace, returns `404 Project not found.` The API does not reveal whether
+  the project exists elsewhere. A repeated deletion therefore returns `404
+  Project not found.`
+- This permanently deletes the local DevPulse project aggregate. It does not
+  delete or modify the repository on GitHub, and it does not uninstall the
+  workspace's GitHub App installation. It is distinct from repository
+  disconnection, which retains the project and historical metadata.
+- In one transaction, the API deletes webhook events linked to the project's
+  repository, recommendations, risk assessments, pull requests, issues, and
+  workflow runs tied to the project's repository, the repository record for the
+  project (if present), and the project record. Every step is scoped to the
+  project or its repository and the path workspace.
+- Webhook events that are not linked to the project's repository, including
+  workspace-level and other-project events, are preserved. The API cannot
+  attribute repository-less webhook events to a project, so it does not delete
+  them.
+- Other projects, workspace memberships, users and sessions, the GitHub
+  installation record and its credentials, repositories belonging to other
+  projects, and external GitHub data are preserved.
+- The project's local repository record is permanently deleted because it is
+  exclusively owned by the project. This releases its globally unique GitHub
+  repository identifier for a future connection. Reconnecting the repository
+  later is a separate future workflow.
+- If the repository record is not found in legacy/pre-invariant data, deletion
+  still proceeds for project-scoped aggregate records and the project itself
+  without failing. No repository-linked activity or webhook records are deleted
+  in that case because they cannot be identified.
 
-Response: `204 No Content`. Errors: `400` for malformed UUIDs, `401`, `403`,
-`404`, and `500`.
+Response: `204 No Content` with no response body.
 
-Confirmation of permanent-delete versus retention behavior is required before
-this endpoint is implemented.
+Error responses:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid workspace UUID or project UUID |
+| `401` | Missing or invalid authentication |
+| `403` | The authenticated member lacks permission to delete projects |
+| `404` | Workspace does not exist or is not accessible, or the project is absent from the path workspace |
+| `500` | Unexpected server failure, including a rolled-back deletion |
 
 ### Pull requests and reviews
 
@@ -805,12 +1064,31 @@ Readiness checks must not expose secrets or detailed internal configuration.
 - Workspace listing uses validated offset pagination (`page`/`limit`) because a
   user's workspace set is expected to be small. Cursor pagination remains the
   preferred convention for large collections.
-- Project endpoints are workspace-scoped and proposed only. `OWNER` and `ADMIN`
-  may create, update, and delete projects; `MEMBER` and `VIEWER` are read-only.
+- Project endpoints are workspace-scoped. Project creation, listing, individual
+  retrieval, updates, and deletion are implemented. `OWNER` and `ADMIN` may
+  create, update, and delete projects; `MEMBER` and `VIEWER` are read-only.
   Non-members and cross-workspace project access return `404`.
-- Project creation is a future atomic project-plus-repository operation driven by
-  GitHub App repository selection. Clients do not submit arbitrary repository
-  metadata, and repo-less project creation is not part of the MVP.
+- Individual project retrieval checks workspace membership before querying and
+  scopes the lookup by both project ID and path workspace ID. Missing projects and
+  projects in another workspace both return `404 Project not found.`
+- Project listing requires any active workspace membership, checks membership
+  before querying projects, filters both the page and total count by the path
+  workspace, and uses validated offset pagination with deterministic
+  `createdAt`-then-ID ordering and a single repository relation select.
+- Project creation is an atomic project-plus-repository operation. `OWNER` and
+  `ADMIN` authorization, UUID and body validation, global repository uniqueness,
+  workspace-scoped installation validation, safe response mapping, and
+  transaction rollback are implemented. Clients do not submit arbitrary
+  repository metadata, and repo-less project creation is not part of the MVP.
+- Repository selection is behind a server-side GitHub repository resolver. The
+  GitHub App implementation is still pending, so the current resolver returns
+  `503` and no project is created until that integration is implemented.
+- Project deletion is restricted to `OWNER` and `ADMIN` members and permanently
+  purges project-scoped metadata and the project's exclusively owned repository
+  record in one transaction. It preserves the workspace, GitHub installation,
+  other projects, users, sessions, memberships, unattributed webhook events, and
+  external GitHub data. It does not uninstall the GitHub App. The global GitHub
+  repository identifier is released for a future connection.
 - GitHub numeric identifiers are represented as decimal strings in API payloads.
 
 ## Open API decisions
@@ -825,7 +1103,7 @@ Readiness checks must not expose secrets or detailed internal configuration.
 - Whether a public API is offered beyond the browser application
 - Whether project creation accepts `repositoryGithubId` directly after server-side
   GitHub verification or an opaque repository-selection token
-- Whether project deletion permanently purges local repository/history records or
-  follows a retention/archive policy
+- Whether project deletion should ever use a retention/archive model instead of
+  the implemented permanent local purge
 - Whether `Project.slug` is exposed in API responses or removed
 - Whether archived GitHub repositories can be newly connected to projects

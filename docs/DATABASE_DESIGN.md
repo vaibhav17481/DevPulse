@@ -231,15 +231,17 @@ The target invariant is that every project has exactly one connected repository.
 The implemented schema enforces the inverse side (one repository per project) and
 at most one repository per project, but it currently allows a project with no
 repository. The database cannot enforce the parent-requires-child side without a
-deferred constraint trigger or an equivalent transactional invariant. Project
-creation should therefore create the project and repository atomically; if the
+deferred constraint trigger or an equivalent transactional invariant. Batch 8B
+project creation therefore creates the project and repository atomically. If the
 exact-one rule is retained, a future migration should add a deferred trigger that
 rejects committing a project without a repository.
 
 A project-without-repository state is not part of the MVP. It would add empty
 states, duplicate lifecycle rules, and permit repository ownership to remain
-ambiguous. Project creation should wait for repository selection through the
-GitHub App and insert both records in one transaction.
+ambiguous. Project creation resolves repository selection through the GitHub App
+and inserts both records in one transaction. Until the GitHub App resolver is
+implemented, the endpoint returns `503` rather than committing a repo-less
+project.
 
 ### GitHubInstallation
 
@@ -288,14 +290,19 @@ does not by itself define transfer behavior.
 
 A repository's installation is required, but the implemented foreign key checks
 only `installationId`. It does not ensure that the installation belongs to the
-repository's `workspaceId`. Application code must validate this today, and a
-future migration should add a composite installation/workspace foreign key so a
-repository cannot reference another workspace's installation.
+repository's `workspaceId`. Batch 8B project creation validates the installation
+against the path workspace in application code, rejects mismatches as `404`, and
+Batch 8G adds an `ACTIVE` installation-status check; direct database writes can
+still violate the rule. A future migration should add a composite
+installation/workspace foreign key so a repository cannot reference another
+workspace's installation.
 
 Disconnection changes `connectionStatus` and `disconnectedAt`; it does not delete
 the repository or its historical activity, and it does not delete the project.
-Repository data deletion and project deletion are separate operations requiring
-an approved lifecycle and retention decision.
+Project deletion is a separate operation that permanently deletes the project's
+exclusively owned repository record and its project-scoped history. It does not
+delete or modify the repository on GitHub, and it does not touch repositories
+owned by other projects.
 
 ### WebhookEvent
 
@@ -454,14 +461,18 @@ consistency rules with composite foreign keys:
   `(projectId, workspaceId)`.
 
 These constraints prevent a child record from pointing at a parent in a different
-workspace even if application code supplies inconsistent identifiers.
+workspace even if application code supplies inconsistent identifiers. Batch 8G
+adds integration tests that exercise the repository-to-project and
+repository-to-workspace constraints, project repository uniqueness, and the
+restrictive project/workspace deletion behavior against PostgreSQL.
 
 `Repository.installationId` is not yet part of a composite workspace constraint.
 A direct database write can currently attach a repository in workspace A to an
-installation in workspace B. Application code must reject that combination today.
-The recommended Phase 8B migration is to add a unique `(id, workspaceId)` key to
-`GitHubInstallation` and reference `(installationId, workspaceId)` from
-`Repository`.
+installation in workspace B. Application code must reject that combination today;
+Batch 8B project creation performs this check inside its transaction, including
+the installation's `ACTIVE` status. The recommended future migration is to add a
+unique `(id, workspaceId)` key to `GitHubInstallation` and reference
+`(installationId, workspaceId)` from `Repository`.
 
 `WebhookEvent` uses optional direct references because a delivery may arrive
 before its installation or repository is known. The application must keep its
@@ -596,32 +607,40 @@ workspace-owned rows. Retention periods for non-deletion flows, disconnected
 repositories, and other historical data remain undefined and still require
 product-level approval.
 
-### Project deletion (proposed, requires approval)
+### Project deletion (implemented)
 
 Repository disconnection and project deletion are different actions:
 
 - Disconnecting a repository changes its connection state, stops active
   synchronization, and retains the project plus historical activity.
 - Deleting a project is a permanent local deletion of the project aggregate. It
-  must not delete or modify the repository on GitHub and must not uninstall the
+  does not delete or modify the repository on GitHub and does not uninstall the
   workspace's GitHub App installation.
 
-If permanent project deletion is approved, the recommended transaction is:
+The implemented transaction:
 
-1. Verify the authenticated actor's `OWNER` or `ADMIN` membership.
-2. Resolve the project by both `projectId` and `workspaceId`.
-3. Delete webhook events linked to the project's repository.
-4. Delete the project's recommendations and risk assessments.
-5. Delete pull requests, issues, and workflow runs for the repository.
-6. Delete the repository record.
-7. Delete the project record.
+1. Verifies the authenticated actor's `OWNER` or `ADMIN` membership and resolves
+   the project by both `projectId` and `workspaceId`.
+2. Deletes webhook events linked to the project's repository by `repositoryId`.
+3. Deletes the project's recommendations and risk assessments by `projectId` and
+   `workspaceId`.
+4. Deletes pull requests, issues, and workflow runs for the repository by
+   `repositoryId` and `workspaceId`.
+5. Deletes the repository record by `id`, `projectId`, and `workspaceId`.
+6. Deletes the project record by its `id_workspaceId` unique key.
 
 This matches the workspace deletion purge order and leaves other projects,
-workspace memberships, the GitHub installation, and external GitHub data intact.
-Deleting the repository record releases its global GitHub identifier for a future
-connection; that consequence requires explicit approval. If retention is required
-instead, project deletion must use a softer archive/retention model and must not
-use this purge.
+workspace memberships, users, sessions, the GitHub installation, unrelated
+repositories, and unattributed webhook events intact. Webhook events that cannot
+be attributed to the project's repository are not deleted. Deleting the
+repository record releases its global GitHub identifier for a future connection.
+
+If no repository record exists, legacy/pre-invariant deletion still removes the
+project and any records directly scoped to it. Repository-linked activity and
+webhook events cannot be identified in that case and are preserved. The foreign
+keys from project-related tables to `Project` and `Repository` remain restrictive;
+the API deletes child records explicitly rather than relying on database
+cascades.
 
 ## Webhook processing design
 
@@ -676,10 +695,13 @@ requirements favor extracting only required fields at ingestion time.
 The following cannot be guaranteed by the implemented Prisma schema alone:
 
 - Every project has a connected repository. The schema currently allows zero or
-  one; project creation must be atomic, and a future deferred trigger should
-  enforce exactly one if the MVP keeps that rule.
+  one; Batch 8B project creation writes both records atomically and never creates a
+  repo-less project. A future deferred trigger should enforce exactly one if the
+  MVP keeps that rule.
 - A repository's installation belongs to the same workspace as the repository.
-  This gap should be closed by a composite foreign key in Phase 8B.
+  Batch 8B project creation validates this in application code, including that the
+  installation is active; the gap should be closed by a composite foreign key in a
+  future migration.
 - A webhook event's optional workspace reference matches its installation and
   repository references when those are known.
 - A recommendation's risk assessment belongs to the same project and workspace.
@@ -691,9 +713,9 @@ The following cannot be guaranteed by the implemented Prisma schema alone:
 Batch 5C deferred migration work. Batch 6B created and committed the initial
 `init_devpulse` migration and verified it against an isolated PostgreSQL instance.
 Batch 7E added the `enforce_workspace_owner_invariants` migration and verified it
-against an isolated PostgreSQL instance. The Docker Compose development database
-still requires both migrations to be applied, and no shared or production
-database has been migrated.
+against an isolated PostgreSQL instance. Batch 8B added no schema or migration
+changes. The Docker Compose development database still requires both migrations
+to be applied, and no shared or production database has been migrated.
 
 ## Resolved decisions
 
@@ -715,9 +737,18 @@ database has been migrated.
 - A GitHub repository cannot be connected to multiple projects or workspaces at
   the same time. Disconnected repository records remain attached to their existing
   project unless a future transfer flow is approved.
-- Project creation waits for repository selection through the GitHub App and
+- Project deletion permanently purges the project aggregate and its exclusively
+  owned repository record in one API transaction. Child records are removed
+  explicitly with workspace and repository scoping rather than through database
+  cascades. The workspace, GitHub installation, memberships, users, sessions,
+  other projects, unrelated repositories, and unattributable webhook events are
+  preserved.
+- Project creation resolves repository selection through the GitHub App and
   creates the project and repository atomically. A repo-less project creation
-  state is not part of the MVP.
+  state is not part of the MVP. Batch 8B implements the atomic write, duplicate
+  checks, and workspace-scoped installation validation behind a resolver seam; the
+  GitHub App resolver and a database composite installation/workspace constraint
+  remain pending.
 
 ## Open decisions
 
@@ -736,8 +767,6 @@ database has been migrated.
   database trigger in addition to atomic application creation
 - Whether `Project.slug` is retained or removed before the project API is
   implemented
-- Whether project deletion permanently purges local repository metadata and
-  history or uses a retention/archive model
 - Whether disconnected repositories may ever be reassigned to another project or
   workspace
 - Whether archived GitHub repositories may be newly connected to a project

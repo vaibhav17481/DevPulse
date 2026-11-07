@@ -65,6 +65,8 @@ DECLARE
   target_workspace_id uuid;
   remaining_owner_count integer;
 BEGIN
+  -- The workspace losing this membership must retain an OWNER. When an OWNER is
+  -- moved to another workspace, that is OLD."workspace_id".
   target_workspace_id := OLD."workspace_id";
 
   IF OLD."role" <> 'OWNER' THEN
@@ -75,7 +77,12 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  IF TG_OP = 'UPDATE' AND NEW."role" = 'OWNER' THEN
+  -- An OWNER update that stays in the same workspace does not remove an owner
+  -- from any workspace. A workspace_id change must be checked against the OLD
+  -- workspace below.
+  IF TG_OP = 'UPDATE'
+    AND NEW."role" = 'OWNER'
+    AND NEW."workspace_id" IS NOT DISTINCT FROM OLD."workspace_id" THEN
     RETURN NEW;
   END IF;
 
@@ -123,6 +130,6 @@ END;
 $$;
 
 CREATE TRIGGER "devpulse_workspace_members_require_owner"
-BEFORE DELETE OR UPDATE OF "role" ON "workspace_members"
+BEFORE DELETE OR UPDATE OF "role", "workspace_id" ON "workspace_members"
 FOR EACH ROW
 EXECUTE FUNCTION "devpulse_enforce_workspace_owner_on_membership_change"();

@@ -7,10 +7,22 @@ implemented from what is planned. The repository currently contains the root pnp
 workspace, the application scaffolds, the Prisma database package, the initial
 schema and migration, and email/password authentication with database-backed
 sessions. Registration, login, current-user lookup, session validation, logout,
-workspace creation, and membership-filtered workspace listing and retrieval are
-implemented. PostgreSQL persistence has been verified against isolated PostgreSQL
-instances. The Docker Compose development database, Redis, and BullMQ are not
-implemented or verified yet.
+workspace creation, membership-filtered workspace listing and retrieval, project
+creation, project listing, individual project retrieval, project updates, and
+project deletion are implemented. Project creation includes workspace-scoped
+authorization, validation, duplicate-repository checks, and atomic
+project-plus-repository writes, but its successful path depends on a GitHub App
+repository resolver that is still pending; the default resolver returns `503`.
+Repository resolution requires an `ACTIVE` GitHub installation that belongs to
+the path workspace. Project listing requires any workspace membership and
+filters, orders, and paginates projects by the path workspace. Individual project
+retrieval checks workspace membership and scopes project lookup by both project
+ID and path workspace ID. Project updates and deletion require `OWNER` or `ADMIN`
+membership, scope all writes by project ID and path workspace ID, and preserve the
+repository unless the whole project aggregate is deleted.
+PostgreSQL persistence has been verified against isolated PostgreSQL instances.
+The Docker Compose development database, Redis, and BullMQ are not implemented or
+verified yet.
 
 ## Architecture summary
 
@@ -235,16 +247,23 @@ connected to exactly one GitHub Repository. The implemented schema enforces the
 workspace relationship, at most one repository per project, and the repository's
 workspace matching its project's workspace. It does not yet enforce that a
 project has a repository at commit time, and a Repository's installation is not
-constrained to the same workspace. Those are implementation gaps to close before
-project write endpoints are exposed.
+constrained to the same workspace by a database composite foreign key.
 
-Project creation is planned as one atomic operation after repository selection
-through the GitHub App. The API will resolve the repository from the workspace's
-active installation and derive canonical GitHub metadata server-side. It will not
-accept a project without a repository, and clients will not submit repository
-owner names, URLs, visibility, or other GitHub metadata manually. A
-project-without-repository state is not needed for the MVP and would add an empty
-state, duplicate lifecycle rules, and ambiguous repository ownership.
+Project creation is implemented as one atomic operation after repository
+selection through the GitHub App. The API resolves the repository from the
+workspace's active installation, validates that the installation belongs to the
+path workspace, and requires `ACTIVE` installation status before deriving
+canonical GitHub metadata server-side. It does not accept a project without a
+repository, and clients do not submit repository owner names, URLs, visibility,
+or other GitHub metadata manually. A project-without-repository state is not
+needed for the MVP and would add an empty state, duplicate lifecycle rules, and
+ambiguous repository ownership.
+
+Repository resolution is isolated behind a `GITHUB_REPOSITORY_RESOLVER` seam.
+GitHub App verification is not implemented yet, so the default resolver rejects
+with `503` and no project is created. The repository-installation workspace
+relationship is currently enforced in application code during project creation;
+a database-level composite constraint remains planned.
 
 A GitHub repository may be connected to only one DevPulse project at a time. The
 global `githubId` uniqueness constraint enforces this. A disconnected repository
@@ -256,9 +275,24 @@ future transfer decision and is not part of the MVP.
 Repository disconnection is not project deletion. Disconnection stops active
 synchronization and records the disconnection timestamp while retaining the
 project and historical metadata. Project deletion is a separate, explicit
-permanent local purge that must not delete or modify the repository on GitHub.
-The final deletion/retention behavior requires product approval before
-implementation.
+permanent local purge that does not modify the repository on GitHub and does not
+uninstall the workspace's GitHub App installation. In one transaction it removes
+webhook events tied to the project's repository, recommendations, risk
+assessments, pull requests, issues, workflow runs, the project's exclusively owned
+repository record, and the project record. It preserves the workspace, users,
+sessions, memberships, the GitHub installation record, other projects, unrelated
+repositories, and webhook events that cannot be attributed to the deleted
+project. Deleting the local repository record releases its globally unique
+GitHub repository identifier for a future connection; reconnection remains a
+separate future workflow.
+
+Project deletion versus GitHub App disconnection or uninstallation:
+
+- Deleting a project removes only DevPulse-local project data.
+- Disconnecting a repository changes repository connection state and retains its
+  history; it is not implemented as a separate endpoint.
+- Uninstalling the GitHub App is an external GitHub operation. No project
+  endpoint calls GitHub to uninstall or modify an installation.
 
 Project authorization is workspace-scoped:
 
@@ -283,7 +317,7 @@ nonexistent and cross-workspace projects.
 | PostgreSQL and Prisma setup | In progress: database package, initial schema, `init_devpulse` migration, and `enforce_workspace_owner_invariants` migration added; live persistence and ownership triggers verified on isolated PostgreSQL instances; Compose development database pending |
 | Redis and BullMQ setup | Planned |
 | Authentication and workspace authorization | In progress: email/password registration, login, database-backed sessions, session validation, current-user lookup, logout, workspace creation, membership-filtered workspace listing/retrieval/updates, owner-only deletion, and database-enforced last-owner protection implemented; member management, invitations, role changes, ownership transfer, and broader RBAC planned |
-| Project management | Planned: schema supports workspace-scoped projects and one repository per project; Phase 8A completed the design review, but no project endpoints, repository-selection flow, or lifecycle operations are implemented |
+| Project management | In progress: schema supports workspace-scoped projects and one repository per project; authenticated project creation with owner/admin authorization, validation, duplicate checks, atomic project-plus-repository writes, and rollback is implemented behind a GitHub repository resolver seam. The resolver returns `503` until GitHub App verification is implemented. Membership-authorized, workspace-scoped project listing with deterministic ordering, pagination, and repository details is implemented. Membership-authorized individual project retrieval scoped by project ID and path workspace ID is implemented. Owner/admin, workspace-scoped project updates with partial name/description validation and repository preservation are implemented. Owner/admin, workspace-scoped project deletion with transaction-scoped aggregate removal, local repository deletion, webhook-event attribution, and preservation of installations and unrelated workspace data is implemented. Repository disconnection and reconnection flows remain planned |
 | GitHub metadata integration | Planned |
 
 ## Architecture decisions
@@ -306,11 +340,18 @@ Selected decisions:
   sets are expected to be small; cursor pagination remains preferred for larger
   collections.
 - Projects are minimal workspace-scoped containers for exactly one GitHub
-  repository. They are not general project-management records. Project creation
-  will be atomic with repository selection from an active GitHub installation;
-  repo-less project creation is not part of the MVP.
+  repository. They are not general project-management records. Project creation is
+  atomic with repository selection from an active GitHub installation; repo-less
+  project creation is not part of the MVP. Repository resolution is delegated to a
+  GitHub App resolver seam, and the current default resolver returns `503` until
+  GitHub integration is implemented.
 - `MEMBER` and `VIEWER` are read-only for project-management operations.
   `OWNER` and `ADMIN` may create, update, and delete projects.
+- Project deletion is a permanent local purge of the project aggregate and its
+  exclusively owned repository record. It preserves the workspace, GitHub
+  installation, users, sessions, memberships, other projects, unrelated
+  repositories, and webhook events that cannot be attributed to the deleted
+  project. It does not call GitHub to delete a repository or uninstall the App.
 - Repository disconnection is separate from project deletion. Reassigning a
   repository between projects or workspaces is not supported in the MVP.
 
@@ -321,13 +362,11 @@ Open decisions:
 - Whether metrics are computed on demand or materialized by scheduled jobs
 - Repository reconnection behavior after disconnection and how retained
   historical data is handled
-- Whether project deletion permanently purges local repository/history records or
-  retains them under a future retention policy
 - Whether disconnected repository records may ever be reassigned to another
   project or workspace
 - Whether `Project.slug` remains necessary after the UUID-based API is finalized
-- The minimum GitHub permissions and repository-discovery flow required before
-  project creation can be implemented
+- The minimum GitHub permissions and repository-discovery flow required for the
+  project-creation resolver
 - Deployment topology and hosting provider
 - Whether database row-level security is required in addition to application
   authorization
